@@ -1,0 +1,37 @@
+{
+  "repository_path": "/absolute/path/to/java/repository",
+  "workdir": "/absolute/path/to/distillme-workdir",
+  "models": {
+    "investigator": {
+      "family": "gemini",
+      "model": "gemini-1.5-pro-or-compatible",
+      "endpoint": "local-or-distributed",
+      "max_context_tokens": 1000000,
+      "batch_size": 1
+    },
+    "teacher": {
+      "family": "claude",
+      "model": "claude-3.5-sonnet-or-compatible",
+      "endpoint": "local-or-distributed",
+      "max_context_tokens": 200000,
+      "batch_size": 1
+    },
+    "student": {
+      "family": "qwen2.5",
+      "model": "Qwen2.5-Coder-7B-Instruct",
+      "endpoint": "local-gpu",
+      "max_context_tokens": 32768,
+      "batch_size": 8
+    }
+  },
+  "retrieval": {
+    "vector_backend": "local-jsonl",
+    "dense_weight": 0.45,
+    "sparse_weight": 0.35,
+    "symbol_weight": 0.2,
+    "max_chunk_lines": 120,
+    "top_k": 8
+  },
+  "include_globs": ["**/*"],
+  "exclude_dirs": [".git", ".gradle", ".idea", ".mvn/wrapper", "build", "target", "node_modules", "dist", "__pycache__"]
+}
