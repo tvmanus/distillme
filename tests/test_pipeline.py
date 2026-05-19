@@ -76,6 +76,7 @@ class PipelineTests(unittest.TestCase):
 
             results = DistillationPipeline(config).run(resume=False)
 
+            self.assertEqual(set(results), {"ingest", "investigate", "teach", "validate", "train", "evaluate"})
             self.assertTrue(all(result.status == "succeeded" for result in results.values()))
             self.assertTrue((config.workdir / "index/manifest.json").exists())
             self.assertTrue((config.workdir / "investigator/architecture_overview.md").exists())

@@ -50,7 +50,7 @@ class ValidationPipeline:
             ),
             encoding="utf-8",
         )
-        return {"examples": len(examples), "failures": len(failures)}
+        return {"examples": len(examples), "failure_count": len(failures)}
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:

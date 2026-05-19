@@ -99,7 +99,9 @@ class RepositoryIngestor:
         boundaries = _semantic_boundaries(lines, self.config.retrieval.max_chunk_lines)
         chunks = []
         for index, (start, end) in enumerate(boundaries):
-            body = "\n".join(lines[start - 1 : end])
+            start_index = start - 1
+            end_exclusive = end
+            body = "\n".join(lines[start_index:end_exclusive])
             symbols = _extract_symbols(body)
             chunks.append(
                 Chunk(
@@ -174,6 +176,7 @@ def _semantic_boundaries(lines: list[str], max_lines: int) -> list[tuple[int, in
         if not line.strip() or brace_depth == 0:
             last_break = number
         if number - start + 1 >= max_lines:
+            # Prefer a natural break; if none exists in this window, end at the current line to preserve every line.
             end = last_break if last_break > start else number
             boundaries.append((start, end))
             start = end + 1

@@ -9,6 +9,18 @@ from typing import Any
 
 from distillme.schemas import ModelSpec
 
+DEFAULT_EXCLUDE_DIRS = (
+    ".git",
+    ".gradle",
+    ".idea",
+    ".mvn/wrapper",
+    "build",
+    "target",
+    "node_modules",
+    "dist",
+    "__pycache__",
+)
+
 
 @dataclass(frozen=True)
 class RetrievalConfig:
@@ -29,17 +41,7 @@ class PipelineConfig:
     student: ModelSpec
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
     include_globs: tuple[str, ...] = ("**/*",)
-    exclude_dirs: tuple[str, ...] = (
-        ".git",
-        ".gradle",
-        ".idea",
-        ".mvn/wrapper",
-        "build",
-        "target",
-        "node_modules",
-        "dist",
-        "__pycache__",
-    )
+    exclude_dirs: tuple[str, ...] = DEFAULT_EXCLUDE_DIRS
 
     @classmethod
     def default(cls, repository_path: Path, workdir: Path) -> "PipelineConfig":
@@ -83,7 +85,7 @@ class PipelineConfig:
             student=ModelSpec(role="student", **raw["models"]["student"]),
             retrieval=RetrievalConfig(**retrieval_raw),
             include_globs=tuple(raw.get("include_globs", ("**/*",))),
-            exclude_dirs=tuple(raw.get("exclude_dirs", cls.__dataclass_fields__["exclude_dirs"].default)),
+            exclude_dirs=tuple(raw.get("exclude_dirs", DEFAULT_EXCLUDE_DIRS)),
         )
 
     def validate(self) -> None:

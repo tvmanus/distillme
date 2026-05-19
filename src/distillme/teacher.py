@@ -21,7 +21,7 @@ TASK_CATEGORIES = (
     "security_task",
     "performance_task",
 )
-_DIFFICULTIES = ("easy", "medium", "hard", "expert", "multi-hop", "adversarial")
+DIFFICULTIES = ("easy", "medium", "hard", "expert", "multi-hop", "adversarial")
 
 
 class TeacherAgent:
@@ -73,7 +73,7 @@ class TeacherAgent:
                 DatasetExample(
                     task_id=f"{category}-{index:05d}",
                     task_category=category,
-                    difficulty=_DIFFICULTIES[index % len(_DIFFICULTIES)],
+                    difficulty=DIFFICULTIES[index % len(DIFFICULTIES)],
                     repository_context=f"Investigator document: {finding['path']}",
                     retrieved_context=contexts,
                     question=_question_for(category, supporting_files),
