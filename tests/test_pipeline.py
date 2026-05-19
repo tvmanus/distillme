@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import unittest
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -50,7 +51,8 @@ class GreeterTest {
 class PipelineTests(unittest.TestCase):
     def test_config_rejects_correlated_model_families(self) -> None:
         with self.subTest("same teacher and student family is rejected"):
-            with TemporaryDirectory() as tmp_path:
+            with tempfile.TemporaryDirectory() as directory:
+                tmp_path = Path(directory)
                 repo = tmp_path / "repo"
                 repo.mkdir()
                 config = PipelineConfig.default(repo, tmp_path / "work")
@@ -65,7 +67,8 @@ class PipelineTests(unittest.TestCase):
                     bad.validate()
 
     def test_pipeline_generates_grounded_artifacts(self) -> None:
-        with TemporaryDirectory() as tmp_path:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
             repo = tmp_path / "repo"
             repo.mkdir()
             _write_sample_repo(repo)
@@ -84,7 +87,8 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(report["passed"])
 
     def test_hybrid_retriever_finds_symbols_after_ingest(self) -> None:
-        with TemporaryDirectory() as tmp_path:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
             repo = tmp_path / "repo"
             repo.mkdir()
             _write_sample_repo(repo)
@@ -95,17 +99,6 @@ class PipelineTests(unittest.TestCase):
 
             self.assertTrue(hits)
             self.assertTrue(hits[0].chunk.path.endswith("Greeter.java"))
-
-
-class TemporaryDirectory:
-    def __enter__(self) -> Path:
-        import tempfile
-
-        self._tmp = tempfile.TemporaryDirectory()
-        return Path(self._tmp.name)
-
-    def __exit__(self, *args: object) -> None:
-        self._tmp.cleanup()
 
 
 if __name__ == "__main__":

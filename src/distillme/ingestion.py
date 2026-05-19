@@ -100,7 +100,7 @@ class RepositoryIngestor:
         chunks = []
         for index, (start, end) in enumerate(boundaries):
             body = "\n".join(lines[start - 1 : end])
-            symbols = tuple(sorted(set(_TYPE_SYMBOL_RE.findall(body)).union(_METHOD_SYMBOL_RE.findall(body))))
+            symbols = _extract_symbols(body)
             chunks.append(
                 Chunk(
                     chunk_id=f"{artifact.artifact_id}:{index}",
@@ -180,3 +180,9 @@ def _semantic_boundaries(lines: list[str], max_lines: int) -> list[tuple[int, in
     if start <= len(lines):
         boundaries.append((start, len(lines)))
     return boundaries
+
+
+def _extract_symbols(text: str) -> tuple[str, ...]:
+    type_symbols = set(_TYPE_SYMBOL_RE.findall(text))
+    method_symbols = set(_METHOD_SYMBOL_RE.findall(text))
+    return tuple(sorted(type_symbols.union(method_symbols)))

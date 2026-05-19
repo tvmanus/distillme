@@ -47,7 +47,7 @@ class HybridRetriever:
         hits: list[RetrievalHit] = []
         for chunk in self.chunks:
             chunk_tokens = _tokens(chunk.text)
-            sparse = _bm25ish(query_tokens, chunk_tokens, self.document_frequency, max(len(self.chunks), 1))
+            sparse = _bm25_approximate_score(query_tokens, chunk_tokens, self.document_frequency, max(len(self.chunks), 1))
             dense = _cosine(query_vector, _hash_vector(chunk_tokens))
             symbol = len(query_tokens.intersection({symbol.lower() for symbol in chunk.symbols}))
             score = 0.45 * dense + 0.35 * sparse + 0.20 * symbol
@@ -87,7 +87,9 @@ def _document_frequency(chunks: Iterable[Chunk]) -> dict[str, int]:
     return counts
 
 
-def _bm25ish(query_tokens: set[str], document_tokens: list[str], document_frequency: dict[str, int], documents: int) -> float:
+def _bm25_approximate_score(
+    query_tokens: set[str], document_tokens: list[str], document_frequency: dict[str, int], documents: int
+) -> float:
     if not query_tokens or not document_tokens:
         return 0.0
     term_counts: dict[str, int] = {}
