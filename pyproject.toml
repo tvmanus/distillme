@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "distillme"
+version = "0.1.0"
+description = "Agentic repository knowledge distillation pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "GPL-3.0-or-later" }
+authors = [{ name = "distillme contributors" }]
+keywords = ["knowledge-distillation", "rag", "software-engineering", "llm", "java"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+
+[project.scripts]
+distillme = "distillme.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
