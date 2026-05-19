@@ -99,6 +99,8 @@ class PipelineTests(unittest.TestCase):
 
             self.assertTrue(hits)
             self.assertTrue(hits[0].chunk.path.endswith("Greeter.java"))
+            self.assertGreater(hits[0].score, 0)
+            self.assertIn("greet", hits[0].chunk.text)
 
 
 if __name__ == "__main__":

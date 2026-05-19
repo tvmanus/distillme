@@ -174,7 +174,7 @@ def _semantic_boundaries(lines: list[str], max_lines: int) -> list[tuple[int, in
         if not line.strip() or brace_depth == 0:
             last_break = number
         if number - start + 1 >= max_lines:
-            end = max(last_break, start)
+            end = last_break if last_break > start else number
             boundaries.append((start, end))
             start = end + 1
     if start <= len(lines):

@@ -31,7 +31,7 @@ class ValidationPipeline:
                 failures.append({"task_id": task_id, "reason": "duplicate question"})
             seen_questions.add(str(example.get("question")))
             retrieved_context = example.get("retrieved_context") or []
-            if files and len(retrieved_context) == 0:
+            if files and not retrieved_context:
                 failures.append({"task_id": task_id, "reason": "missing retrieved context"})
             confidence = float(example.get("confidence", 0.0))
             has_uncertainty_marker = "uncertain" in str(example.get("answer", "")).lower()

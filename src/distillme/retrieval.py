@@ -49,15 +49,15 @@ class HybridRetriever:
             chunk_tokens = _tokens(chunk.text)
             sparse = _bm25_approximate_score(query_tokens, chunk_tokens, self.document_frequency, max(len(self.chunks), 1))
             dense = _cosine(query_vector, _hash_vector(chunk_tokens))
-            symbol = len(query_tokens.intersection({symbol.lower() for symbol in chunk.symbols}))
-            score = 0.45 * dense + 0.35 * sparse + 0.20 * symbol
+            symbol_match_count = len(query_tokens.intersection({symbol.lower() for symbol in chunk.symbols}))
+            score = 0.45 * dense + 0.35 * sparse + 0.20 * symbol_match_count
             if score > 0:
                 reasons = []
                 if dense > 0:
                     reasons.append("dense_hash_overlap")
                 if sparse > 0:
                     reasons.append("bm25_token_overlap")
-                if symbol > 0:
+                if symbol_match_count > 0:
                     reasons.append("symbol_match")
                 hits.append(RetrievalHit(chunk=chunk, score=score, reasons=tuple(reasons)))
         return sorted(hits, key=lambda item: item.score, reverse=True)[:top_k]
