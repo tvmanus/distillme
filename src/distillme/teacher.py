@@ -65,6 +65,8 @@ class TeacherAgent:
             query = f"{category} {finding['path']}"
             hits = self.retriever.search(query, top_k=4)
             contexts = [hit.to_context() for hit in hits]
+            if not contexts:
+                contexts = self._fallback_context()
             supporting_files = sorted({str(context["path"]) for context in contexts})
             symbols = sorted({symbol for context in contexts for symbol in context.get("symbols", [])})
             examples.append(
@@ -99,6 +101,22 @@ class TeacherAgent:
                 )
             )
         return examples
+
+    def _fallback_context(self) -> list[dict[str, object]]:
+        if not self.retriever.chunks:
+            return []
+        chunk = self.retriever.chunks[0]
+        return [
+            {
+                "path": chunk.path,
+                "start_line": chunk.start_line,
+                "end_line": chunk.end_line,
+                "symbols": list(chunk.symbols),
+                "score": 0.0,
+                "text": chunk.text,
+                "reasons": ["fallback_grounding_context"],
+            }
+        ]
 
 
 def _question_for(category: str, supporting_files: list[str]) -> str:
