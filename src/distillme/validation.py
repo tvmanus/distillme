@@ -8,6 +8,8 @@ from typing import Any
 
 from distillme.schemas import PipelinePaths
 
+UNCERTAINTY_LANGUAGE = ("uncertain", "not sure", "possibly", "maybe", "unclear", "insufficient", "unknown")
+
 
 class ValidationPipeline:
     """Performs deterministic quality checks before training."""
@@ -34,7 +36,8 @@ class ValidationPipeline:
             if files and not retrieved_context:
                 failures.append({"task_id": task_id, "reason": "missing retrieved context"})
             confidence = float(example.get("confidence", 0.0))
-            answer_expresses_uncertainty = "uncertain" in str(example.get("answer", "")).lower()
+            answer = str(example.get("answer", "")).lower()
+            answer_expresses_uncertainty = any(indicator in answer for indicator in UNCERTAINTY_LANGUAGE)
             if confidence < 0.5 and not answer_expresses_uncertainty:
                 failures.append({"task_id": task_id, "reason": "answer lacks uncertainty calibration"})
         self.paths.dataset_dir.mkdir(parents=True, exist_ok=True)

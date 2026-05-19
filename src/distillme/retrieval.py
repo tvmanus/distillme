@@ -46,6 +46,8 @@ class HybridRetriever:
         self.index_dir = index_dir
         self.chunks = _load_chunks(index_dir / "chunks.jsonl")
         self.document_frequency = _document_frequency(self.chunks)
+        self.chunk_tokens = {chunk.chunk_id: _tokens(chunk.text) for chunk in self.chunks}
+        self.term_frequencies = {chunk.chunk_id: _term_counts(self.chunk_tokens[chunk.chunk_id]) for chunk in self.chunks}
         self.dense_weight = dense_weight
         self.sparse_weight = sparse_weight
         self.symbol_weight = symbol_weight
@@ -55,8 +57,13 @@ class HybridRetriever:
         query_vector = _hash_vector(query_tokens)
         hits: list[RetrievalHit] = []
         for chunk in self.chunks:
-            chunk_tokens = _tokens(chunk.text)
-            sparse = _bm25_approximate_score(query_tokens, chunk_tokens, self.document_frequency, max(len(self.chunks), 1))
+            chunk_tokens = self.chunk_tokens[chunk.chunk_id]
+            sparse = _bm25_approximate_score(
+                query_tokens,
+                self.term_frequencies[chunk.chunk_id],
+                self.document_frequency,
+                max(len(self.chunks), 1),
+            )
             dense = _cosine(query_vector, _hash_vector(chunk_tokens))
             symbol_match_count = len(query_tokens.intersection({symbol.lower() for symbol in chunk.symbols}))
             score = self.dense_weight * dense + self.sparse_weight * sparse + self.symbol_weight * symbol_match_count
@@ -97,13 +104,10 @@ def _document_frequency(chunks: Iterable[Chunk]) -> dict[str, int]:
 
 
 def _bm25_approximate_score(
-    query_tokens: set[str], document_tokens: list[str], document_frequency: dict[str, int], documents: int
+    query_tokens: set[str], term_counts: dict[str, int], document_frequency: dict[str, int], documents: int
 ) -> float:
-    if not query_tokens or not document_tokens:
+    if not query_tokens or not term_counts:
         return 0.0
-    term_counts: dict[str, int] = {}
-    for token in document_tokens:
-        term_counts[token] = term_counts.get(token, 0) + 1
     score = 0.0
     for token in query_tokens:
         tf = term_counts.get(token, 0)
@@ -112,6 +116,13 @@ def _bm25_approximate_score(
         idf = math.log((documents + 1) / (document_frequency.get(token, 0) + 1)) + 1
         score += idf * (tf / (tf + 1.2))
     return score / max(len(query_tokens), 1)
+
+
+def _term_counts(tokens: list[str]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for token in tokens:
+        counts[token] = counts.get(token, 0) + 1
+    return counts
 
 
 def _hash_vector(tokens: Iterable[str], dimensions: int = 64) -> list[float]:

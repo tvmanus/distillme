@@ -175,7 +175,8 @@ def _semantic_boundaries(lines: list[str], max_lines: int) -> list[tuple[int, in
         brace_depth += line.count("{") - line.count("}")
         if not line.strip() or brace_depth == 0:
             last_break = number
-        if number - start + 1 >= max_lines:
+        current_chunk_line_count = number - start + 1
+        if current_chunk_line_count >= max_lines:
             # Prefer natural breaks (empty lines or closed brace scopes); otherwise preserve the full window.
             end = last_break if last_break > start else number
             boundaries.append((start, end))

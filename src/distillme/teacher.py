@@ -22,6 +22,8 @@ TASK_CATEGORIES = (
     "performance_task",
 )
 DIFFICULTIES = ("easy", "medium", "hard", "expert", "multi-hop", "adversarial")
+CONFIDENCE_WITH_RETRIEVED_CONTEXT = 0.55
+CONFIDENCE_WITHOUT_RETRIEVED_CONTEXT = 0.25
 
 
 class TeacherAgent:
@@ -97,7 +99,7 @@ class TeacherAgent:
                     negative_examples=[
                         "Do not invent classes, APIs, runtime behavior, or architectural intent absent from retrieved context."
                     ],
-                    confidence=0.55 if contexts else 0.25,
+                    confidence=CONFIDENCE_WITH_RETRIEVED_CONTEXT if contexts else CONFIDENCE_WITHOUT_RETRIEVED_CONTEXT,
                 )
             )
         return examples
