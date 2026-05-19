@@ -176,7 +176,7 @@ def _semantic_boundaries(lines: list[str], max_lines: int) -> list[tuple[int, in
         if not line.strip() or brace_depth == 0:
             last_break = number
         if number - start + 1 >= max_lines:
-            # Prefer a natural break; if none exists in this window, end at the current line to preserve every line.
+            # Prefer natural breaks (empty lines or closed brace scopes); otherwise preserve the full window.
             end = last_break if last_break > start else number
             boundaries.append((start, end))
             start = end + 1

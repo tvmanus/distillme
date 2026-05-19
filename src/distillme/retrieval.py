@@ -36,10 +36,19 @@ class RetrievalHit:
 class HybridRetriever:
     """Deterministic retrieval backend suitable for local validation and tests."""
 
-    def __init__(self, index_dir: Path) -> None:
+    def __init__(
+        self,
+        index_dir: Path,
+        dense_weight: float = 0.45,
+        sparse_weight: float = 0.35,
+        symbol_weight: float = 0.20,
+    ) -> None:
         self.index_dir = index_dir
         self.chunks = _load_chunks(index_dir / "chunks.jsonl")
         self.document_frequency = _document_frequency(self.chunks)
+        self.dense_weight = dense_weight
+        self.sparse_weight = sparse_weight
+        self.symbol_weight = symbol_weight
 
     def search(self, query: str, top_k: int = 8) -> list[RetrievalHit]:
         query_tokens = set(_tokens(query))
@@ -50,7 +59,7 @@ class HybridRetriever:
             sparse = _bm25_approximate_score(query_tokens, chunk_tokens, self.document_frequency, max(len(self.chunks), 1))
             dense = _cosine(query_vector, _hash_vector(chunk_tokens))
             symbol_match_count = len(query_tokens.intersection({symbol.lower() for symbol in chunk.symbols}))
-            score = 0.45 * dense + 0.35 * sparse + 0.20 * symbol_match_count
+            score = self.dense_weight * dense + self.sparse_weight * sparse + self.symbol_weight * symbol_match_count
             if score > 0:
                 reasons = []
                 if dense > 0:

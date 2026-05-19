@@ -65,9 +65,9 @@ class DistillationPipeline:
         if stage == "ingest":
             return RepositoryIngestor(self.config, self.paths).run
         if stage == "investigate":
-            return InvestigatorAgent(self.paths, HybridRetriever(self.paths.index_dir)).run
+            return InvestigatorAgent(self.paths, self._retriever()).run
         if stage == "teach":
-            return TeacherAgent(self.paths, HybridRetriever(self.paths.index_dir)).run
+            return TeacherAgent(self.paths, self._retriever()).run
         if stage == "validate":
             return ValidationPipeline(self.paths).run
         if stage == "train":
@@ -75,6 +75,15 @@ class DistillationPipeline:
         if stage == "evaluate":
             return EvaluationPlanner(self.paths).run
         raise ValueError(f"unknown stage: {stage}")
+
+    def _retriever(self) -> HybridRetriever:
+        retrieval = self.config.retrieval
+        return HybridRetriever(
+            self.paths.index_dir,
+            dense_weight=retrieval.dense_weight,
+            sparse_weight=retrieval.sparse_weight,
+            symbol_weight=retrieval.symbol_weight,
+        )
 
     def _load_state(self) -> dict[str, dict[str, object]]:
         if not self.state_path.exists():

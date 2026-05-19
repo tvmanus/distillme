@@ -9,7 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from distillme.config import PipelineConfig
-from distillme.orchestration import DistillationPipeline
+from distillme.orchestration import STAGES, DistillationPipeline
 from distillme.retrieval import HybridRetriever
 
 
@@ -76,7 +76,7 @@ class PipelineTests(unittest.TestCase):
 
             results = DistillationPipeline(config).run(resume=False)
 
-            self.assertEqual(set(results), {"ingest", "investigate", "teach", "validate", "train", "evaluate"})
+            self.assertEqual(set(results), set(STAGES))
             self.assertTrue(all(result.status == "succeeded" for result in results.values()))
             self.assertTrue((config.workdir / "index/manifest.json").exists())
             self.assertTrue((config.workdir / "investigator/architecture_overview.md").exists())

@@ -34,8 +34,8 @@ class ValidationPipeline:
             if files and not retrieved_context:
                 failures.append({"task_id": task_id, "reason": "missing retrieved context"})
             confidence = float(example.get("confidence", 0.0))
-            has_uncertainty_marker = "uncertain" in str(example.get("answer", "")).lower()
-            if confidence < 0.5 and not has_uncertainty_marker:
+            answer_expresses_uncertainty = "uncertain" in str(example.get("answer", "")).lower()
+            if confidence < 0.5 and not answer_expresses_uncertainty:
                 failures.append({"task_id": task_id, "reason": "answer lacks uncertainty calibration"})
         self.paths.dataset_dir.mkdir(parents=True, exist_ok=True)
         (self.paths.dataset_dir / "validation_report.json").write_text(

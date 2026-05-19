@@ -61,7 +61,7 @@ class TeacherAgent:
     def _examples(self, findings: list[dict[str, str]]) -> list[DatasetExample]:
         examples: list[DatasetExample] = []
         for index, category in enumerate(TASK_CATEGORIES):
-            finding = findings[index % len(findings)] if findings else {"path": "none", "text": ""}
+            finding = findings[index % len(findings)] if findings else {"path": "placeholder_no_findings", "text": ""}
             query = f"{category} {finding['path']}"
             hits = self.retriever.search(query, top_k=4)
             contexts = [hit.to_context() for hit in hits]
