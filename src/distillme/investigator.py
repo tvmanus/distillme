@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from distillme.retrieval import RetrievalHit
 from distillme.retrieval import HybridRetriever
 from distillme.schemas import Finding, PipelinePaths
 
@@ -79,7 +80,7 @@ class InvestigatorAgent:
         return {"documents": written}
 
     @staticmethod
-    def _finding_for(document: str, query: str, hits: list[object]) -> Finding:
+    def _finding_for(document: str, query: str, hits: list[RetrievalHit]) -> Finding:
         evidence = []
         refs = []
         for hit in hits[:5]:

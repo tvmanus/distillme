@@ -50,7 +50,7 @@ class GreeterTest {
 class PipelineTests(unittest.TestCase):
     def test_config_rejects_correlated_model_families(self) -> None:
         with self.subTest("same teacher and student family is rejected"):
-            with _temporary_directory() as tmp_path:
+            with TemporaryDirectory() as tmp_path:
                 repo = tmp_path / "repo"
                 repo.mkdir()
                 config = PipelineConfig.default(repo, tmp_path / "work")
@@ -65,7 +65,7 @@ class PipelineTests(unittest.TestCase):
                     bad.validate()
 
     def test_pipeline_generates_grounded_artifacts(self) -> None:
-        with _temporary_directory() as tmp_path:
+        with TemporaryDirectory() as tmp_path:
             repo = tmp_path / "repo"
             repo.mkdir()
             _write_sample_repo(repo)
@@ -84,7 +84,7 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(report["passed"])
 
     def test_hybrid_retriever_finds_symbols_after_ingest(self) -> None:
-        with _temporary_directory() as tmp_path:
+        with TemporaryDirectory() as tmp_path:
             repo = tmp_path / "repo"
             repo.mkdir()
             _write_sample_repo(repo)
@@ -97,7 +97,7 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(hits[0].chunk.path.endswith("Greeter.java"))
 
 
-class _temporary_directory:
+class TemporaryDirectory:
     def __enter__(self) -> Path:
         import tempfile
 

@@ -26,7 +26,10 @@ _TEXT_EXTENSIONS = {
     ".toml": ("toml", "configuration"),
     ".dockerfile": ("dockerfile", "configuration"),
 }
-_SYMBOL_RE = re.compile(r"\b(?:class|interface|enum|record|void|public|private|protected|static|final)\s+([A-Z_a-z][A-Z_a-z0-9]*)")
+_TYPE_SYMBOL_RE = re.compile(r"\b(?:class|interface|enum|record)\s+([A-Z_a-z][A-Z_a-z0-9]*)")
+_METHOD_SYMBOL_RE = re.compile(
+    r"\b(?:public|private|protected)?\s*(?:static\s+)?(?:final\s+)?[A-Z_a-z][A-Z_a-z0-9<>\[\], ?]*\s+([A-Z_a-z][A-Z_a-z0-9]*)\s*\("
+)
 _CALL_RE = re.compile(r"\b([A-Z_a-z][A-Z_a-z0-9]*)\s*\(")
 
 
@@ -97,7 +100,7 @@ class RepositoryIngestor:
         chunks = []
         for index, (start, end) in enumerate(boundaries):
             body = "\n".join(lines[start - 1 : end])
-            symbols = tuple(sorted(set(_SYMBOL_RE.findall(body))))
+            symbols = tuple(sorted(set(_TYPE_SYMBOL_RE.findall(body)).union(_METHOD_SYMBOL_RE.findall(body))))
             chunks.append(
                 Chunk(
                     chunk_id=f"{artifact.artifact_id}:{index}",
