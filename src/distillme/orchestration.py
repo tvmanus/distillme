@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Callable
 
 from distillme.config import PipelineConfig
+from distillme.inference import make_client
 from distillme.ingestion import RepositoryIngestor
 from distillme.investigator import InvestigatorAgent
 from distillme.observability import TraceLogger
@@ -65,9 +66,9 @@ class DistillationPipeline:
         if stage == "ingest":
             return RepositoryIngestor(self.config, self.paths).run
         if stage == "investigate":
-            return InvestigatorAgent(self.paths, self._retriever()).run
+            return InvestigatorAgent(self.paths, self._retriever(), make_client(self.config.investigator)).run
         if stage == "teach":
-            return TeacherAgent(self.paths, self._retriever()).run
+            return TeacherAgent(self.paths, self._retriever(), make_client(self.config.teacher)).run
         if stage == "validate":
             return ValidationPipeline(self.paths).run
         if stage == "train":
