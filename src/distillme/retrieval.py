@@ -263,7 +263,10 @@ class ChromaRetriever:
 
         class _DistillmeEmbeddingFunction(EmbeddingFunction[Documents]):  # type: ignore[misc]
             def __init__(self) -> None:
-                pass  # suppress deprecation warning; no external state needed
+                # ChromaDB ≥1.5 warns if __init__ is not overridden; override
+                # here to silence that deprecation without forwarding to the
+                # base-class stub that triggers the warning.
+                pass
 
             @staticmethod
             def name() -> str:
