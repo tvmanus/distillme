@@ -8,6 +8,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Callable
 
+from distillme.cli_tools import CliExecutor
 from distillme.config import PipelineConfig
 from distillme.inference import make_client
 from distillme.ingestion import RepositoryIngestor
@@ -32,6 +33,7 @@ class DistillationPipeline:
         self.paths.create()
         self.trace = TraceLogger(self.paths.logs_dir)
         self.state_path = self.paths.workdir / "state.json"
+        self._cli = CliExecutor(config.repository_path)
 
     def run(self, resume: bool = True) -> dict[str, StageResult]:
         state = self._load_state() if resume else {}
@@ -66,9 +68,9 @@ class DistillationPipeline:
         if stage == "ingest":
             return RepositoryIngestor(self.config, self.paths).run
         if stage == "investigate":
-            return InvestigatorAgent(self.paths, self._retriever(), make_client(self.config.investigator)).run
+            return InvestigatorAgent(self.paths, self._retriever(), make_client(self.config.investigator), self._cli).run
         if stage == "teach":
-            return TeacherAgent(self.paths, self._retriever(), make_client(self.config.teacher)).run
+            return TeacherAgent(self.paths, self._retriever(), make_client(self.config.teacher), self._cli).run
         if stage == "validate":
             return ValidationPipeline(self.paths).run
         if stage == "train":

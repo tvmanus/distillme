@@ -10,7 +10,11 @@ from distillme.retrieval import HybridRetriever
 from distillme.schemas import DatasetExample, PipelinePaths
 
 if TYPE_CHECKING:
+    from distillme.cli_tools import CliExecutor
     from distillme.inference import LLMClient
+
+# Task categories whose examples include a structured investigation trajectory.
+_TRAJECTORY_CATEGORIES = frozenset({"agentic_task", "cli_exploration_task", "multi_hop_navigation_task", "retrieval_task"})
 
 TASK_CATEGORIES = (
     "code_understanding",
@@ -23,6 +27,8 @@ TASK_CATEGORIES = (
     "retrieval_task",
     "security_task",
     "performance_task",
+    "cli_exploration_task",
+    "multi_hop_navigation_task",
 )
 DIFFICULTIES = ("easy", "medium", "hard", "expert", "multi-hop", "adversarial")
 CONFIDENCE_WITH_RETRIEVED_CONTEXT = 0.55
@@ -110,6 +116,22 @@ _QUESTION_TEMPLATES: dict[str, list[str]] = {
         "How would you reduce lock contention in {files} based on the retrieved concurrency patterns?",
         "Propose an async-execution refactoring for the blocking call visible in {files}.",
     ],
+    "cli_exploration_task": [
+        "Use grep to locate all usages of the primary symbol defined in {files} across the repository.",
+        "Using find and grep, enumerate every file that transitively imports or depends on {files}.",
+        "Construct a git-grep command sequence to trace the change history of the core logic in {files}.",
+        "Use grep with a regex pattern to identify all exception types thrown or caught in {files} and their call sites.",
+        "Write a find command strategy that discovers all test files associated with {files}.",
+        "Describe a grep-based investigation plan to identify every caller of the public API exposed by {files}.",
+    ],
+    "multi_hop_navigation_task": [
+        "Starting from {files}, trace the complete call chain to the persistence or data-access layer.",
+        "Follow the data flow from the entry point in {files} through all intermediate transformations to the final output.",
+        "Identify the event-driven communication path initiated in {files} and trace it to its ultimate consumer.",
+        "Trace the dependency chain from {files} through all transitive dependencies to any external system boundaries.",
+        "Follow the exception propagation path originating in {files} through every catch and rethrow boundary.",
+        "Reconstruct the multi-component interaction sequence initiated by {files}, identifying each intermediate hop.",
+    ],
 }
 
 # Per-category chain-of-thought supervision traces.
@@ -184,6 +206,20 @@ _REASONING_TRACES: dict[str, str] = {
         "Step 4: Check threading and async patterns for contention or blocking. "
         "Step 5: Propose optimisations ranked by expected impact, with risk assessment."
     ),
+    "cli_exploration_task": (
+        "Step 1: Identify the primary symbols defined in the target files using grep or ctags. "
+        "Step 2: Construct targeted grep commands to locate all usages across the repository. "
+        "Step 3: Expand the search to callers, implementors, and related configuration files. "
+        "Step 4: Use git grep to trace the symbol through version history if change tracking is needed. "
+        "Step 5: Summarise the discovered symbol topology, noting areas unreachable by the current index."
+    ),
+    "multi_hop_navigation_task": (
+        "Step 1: Identify the entry point and initial call or event emission in the source files. "
+        "Step 2: Follow the first hop to locate the immediate dependency or consumer. "
+        "Step 3: Continue tracing each hop, recording intermediate files and symbols at every step. "
+        "Step 4: Identify boundary crossings — service, layer, or module transitions. "
+        "Step 5: Produce a complete hop-by-hop chain with a confidence score for each link."
+    ),
 }
 
 # Per-category answer framings (deterministic baseline; real LLM replaces this).
@@ -238,6 +274,16 @@ _ANSWER_FRAMINGS: dict[str, str] = {
         "the hot path and caching opportunities noted in the reasoning trace. "
         "Uncertain about runtime profiling data not present in the indexed artifacts."
     ),
+    "cli_exploration_task": (
+        "The grep-based exploration of {files} reveals the following symbol topology: "
+        "start from the primary definitions in the cited files and trace all usage sites "
+        "confirmed by the retrieved evidence. Flag any symbol usages outside the indexed scope as uncertain."
+    ),
+    "multi_hop_navigation_task": (
+        "The multi-hop navigation from {files} follows the path: "
+        "entry point → [intermediate hops] → final consumer, as reconstructed from the retrieved evidence. "
+        "Each hop is bounded by indexed artifacts; cross-service hops outside the index are marked uncertain."
+    ),
 }
 
 _FALLBACK_ANSWER = (
@@ -254,10 +300,12 @@ class TeacherAgent:
         paths: PipelinePaths,
         retriever: HybridRetriever,
         llm_client: "LLMClient | None" = None,
+        cli_executor: "CliExecutor | None" = None,
     ) -> None:
         self.paths = paths
         self.retriever = retriever
         self.llm_client = llm_client
+        self.cli_executor = cli_executor
 
     def run(self) -> dict[str, int]:
         self.paths.dataset_dir.mkdir(parents=True, exist_ok=True)
@@ -311,6 +359,11 @@ class TeacherAgent:
                 confidence = (
                     CONFIDENCE_WITH_RETRIEVED_CONTEXT if contexts else CONFIDENCE_WITHOUT_RETRIEVED_CONTEXT
                 )
+                investigation_trace = ""
+                if category in _TRAJECTORY_CATEGORIES:
+                    investigation_trace = _build_investigation_trace(
+                        category, supporting_files, self.cli_executor
+                    )
                 examples.append(
                     DatasetExample(
                         task_id=f"{category}-{difficulty}-{global_index:05d}",
@@ -338,6 +391,7 @@ class TeacherAgent:
                             "absent from the retrieved context."
                         ],
                         confidence=confidence,
+                        investigation_trace=investigation_trace,
                     )
                 )
                 global_index += 1
@@ -392,3 +446,56 @@ def _build_answer(
                 pass
     return deterministic
 
+
+def _build_investigation_trace(
+    category: str,
+    supporting_files: list[str],
+    cli_executor: "CliExecutor | None",
+) -> str:
+    """Build a structured investigation trajectory string for agentic dataset examples.
+
+    When *cli_executor* is available the trace includes real command output;
+    otherwise it falls back to a deterministic template that still demonstrates
+    the expected trajectory format.
+    """
+    files_label = ", ".join(supporting_files[:2]) if supporting_files else "the target files"
+    cli_section_lines: list[str] = []
+
+    # Run representative CLI commands when an executor is available.
+    if cli_executor is not None:
+        probe_commands: list[list[str]] = []
+        if category in {"cli_exploration_task", "agentic_task"}:
+            probe_commands = [
+                ["find", ".", "-name", "*.java", "-type", "f"],
+                ["grep", "-r", "--include=*.java", "-l", "class", "."],
+            ]
+        elif category in {"multi_hop_navigation_task", "retrieval_task"}:
+            probe_commands = [
+                ["find", ".", "-type", "f", "-name", "*.java"],
+                ["grep", "-r", "--include=*.java", "-n", "import", "."],
+            ]
+        for args in probe_commands:
+            try:
+                result = cli_executor.run(args)
+                cli_section_lines.append(f"COMMAND: `{result.command}`")
+                cli_section_lines.append(f"OUTPUT SUMMARY:\n{result.summary()}")
+            except ValueError:
+                pass
+
+    cli_block = "\n".join(cli_section_lines) if cli_section_lines else "CLI executor not configured; trajectory is template-based."
+    return (
+        f"OBJECTIVE: Investigate {category.replace('_', ' ')} patterns in {files_label}.\n\n"
+        f"CURRENT HYPOTHESIS: The target files contain {category.replace('_', ' ')} "
+        "patterns that can be confirmed through iterative CLI exploration and RAG retrieval.\n\n"
+        "KNOWN EVIDENCE:\n"
+        f"  - Retrieved context chunks reference: {files_label}\n"
+        "  - Symbol definitions extracted from indexed artifacts\n\n"
+        "UNCERTAINTIES:\n"
+        "  - Runtime behaviour not observable from static source alone\n"
+        "  - Cross-service interactions may extend beyond indexed artifacts\n\n"
+        f"{cli_block}\n\n"
+        "UPDATED UNDERSTANDING: Combined CLI exploration and vector retrieval provide "
+        "grounded evidence for this investigation; remaining gaps require dynamic analysis.\n\n"
+        "NEXT INVESTIGATION STEP: Cross-validate findings against the full call graph and "
+        "inspect test coverage for the identified symbols."
+    )
