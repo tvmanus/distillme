@@ -253,7 +253,7 @@ class CliToolsTests(unittest.TestCase):
             dataset_path = config.workdir / "dataset/instruction_dataset.jsonl"
             records = [json.loads(line) for line in dataset_path.read_text(encoding="utf-8").splitlines()]
             agentic = [r for r in records if r["task_category"] in {"agentic_task", "cli_exploration_task"}]
-            self.assertTrue(agentic, "expected agentic/cli_exploration records")
+            self.assertGreater(len(agentic), 0, "expected agentic/cli_exploration records")
             for record in agentic:
                 self.assertIn("investigation_trace", record)
 

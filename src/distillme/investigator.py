@@ -267,7 +267,7 @@ class AgenticInvestigatorLoop:
         else:
             memory.refine_hypothesis(
                 f"CLI exploration yielded {count} evidence item(s), indicating "
-                f"concrete {document.removesuffix('.md').replace('_', ' ')} artefacts are present and indexable."
+                f"concrete {document.removesuffix('.md').replace('_', ' ')} artifacts are present and indexable."
             )
 
 
