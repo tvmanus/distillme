@@ -93,6 +93,47 @@ class Finding:
 
 
 @dataclass(frozen=True)
+class InvestigationTrace:
+    """Structured investigative trace produced by the agentic investigation loop.
+
+    Captures one iteration of the OBJECTIVE → HYPOTHESIS → EVIDENCE → COMMAND →
+    UPDATED-UNDERSTANDING cycle used by the :class:`AgenticInvestigatorLoop`.
+    """
+
+    objective: str
+    hypothesis: str
+    known_evidence: tuple[str, ...]
+    uncertainties: tuple[str, ...]
+    commands_run: tuple[str, ...]
+    command_summaries: tuple[str, ...]
+    updated_understanding: str
+    next_investigation_step: str
+    confidence: float
+
+    def to_markdown(self) -> str:
+        evidence = "\n".join(f"  - {e}" for e in self.known_evidence) or "  - None gathered yet"
+        uncerts = "\n".join(f"  - {u}" for u in self.uncertainties) or "  - None identified"
+        commands = "\n".join(f"  - `{c}`" for c in self.commands_run) or "  - None executed"
+        summaries = "\n".join(f"  - {s}" for s in self.command_summaries) or "  - No output"
+        return (
+            "### Investigation Trace\n\n"
+            f"**OBJECTIVE:** {self.objective}\n\n"
+            f"**CURRENT HYPOTHESIS:** {self.hypothesis}\n\n"
+            "**KNOWN EVIDENCE:**\n"
+            f"{evidence}\n\n"
+            "**UNCERTAINTIES:**\n"
+            f"{uncerts}\n\n"
+            "**COMMANDS RUN:**\n"
+            f"{commands}\n\n"
+            "**COMMAND OUTPUT SUMMARY:**\n"
+            f"{summaries}\n\n"
+            f"**UPDATED UNDERSTANDING:** {self.updated_understanding}\n\n"
+            f"**NEXT INVESTIGATION STEP:** {self.next_investigation_step}\n\n"
+            f"**CONFIDENCE:** {self.confidence:.2f}\n"
+        )
+
+
+@dataclass(frozen=True)
 class DatasetExample:
     """Synthetic instruction example emitted by the teacher stage."""
 
@@ -110,6 +151,7 @@ class DatasetExample:
     validation_checks: list[str]
     negative_examples: list[str]
     confidence: float
+    investigation_trace: str = ""
 
     def to_jsonable(self) -> dict[str, Any]:
         return asdict(self)

@@ -8,11 +8,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from distillme.cli_tools import CliExecutor, CliResult
 from distillme.config import PipelineConfig
 from distillme.inference import HttpLLMClient, LLMClient, StubLLMClient, make_client
 from distillme.orchestration import STAGES, DistillationPipeline
 from distillme.retrieval import HybridRetriever
-from distillme.schemas import ModelSpec
+from distillme.schemas import InvestigationTrace, ModelSpec
 from distillme.teacher import DIFFICULTIES, TASK_CATEGORIES
 
 
@@ -158,6 +159,118 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(hits[0].chunk.path.endswith("Greeter.java"))
             self.assertGreater(hits[0].score, 0)
             self.assertIn("greet", hits[0].chunk.text)
+
+
+class CliToolsTests(unittest.TestCase):
+    def test_executor_rejects_forbidden_command(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            executor = CliExecutor(Path(directory))
+            with self.assertRaises(ValueError):
+                executor.run(["rm", "-rf", "."])
+
+    def test_executor_rejects_unapproved_command(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            executor = CliExecutor(Path(directory))
+            with self.assertRaises(ValueError):
+                executor.run(["curl", "http://example.com"])
+
+    def test_executor_rejects_unapproved_git_subcommand(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            executor = CliExecutor(Path(directory))
+            with self.assertRaises(ValueError):
+                executor.run(["git", "push"])
+
+    def test_executor_runs_find_in_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            (tmp / "Hello.java").write_text("class Hello {}\n")
+            executor = CliExecutor(tmp)
+            result = executor.run(["find", ".", "-name", "*.java", "-type", "f"])
+            self.assertIsInstance(result, CliResult)
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("Hello.java", result.stdout)
+
+    def test_executor_runs_grep_in_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            (tmp / "Hello.java").write_text("class Hello {}\n")
+            executor = CliExecutor(tmp)
+            result = executor.run(["grep", "-r", "class", ".", "--include=*.java"])
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("Hello", result.stdout)
+
+    def test_cli_result_summary_truncates_long_output(self) -> None:
+        result = CliResult(
+            command="find . -type f",
+            stdout="\n".join(f"./file{i}.java" for i in range(20)),
+            stderr="",
+            returncode=0,
+            truncated=False,
+        )
+        summary = result.summary(max_lines=5)
+        self.assertIn("file0", summary)
+        self.assertIn("more lines", summary)
+
+    def test_investigation_trace_renders_to_markdown(self) -> None:
+        trace = InvestigationTrace(
+            objective="Find auth patterns",
+            hypothesis="Auth is handled in a dedicated service",
+            known_evidence=("AuthService.java found",),
+            uncertainties=("Runtime behaviour unverified",),
+            commands_run=("grep -r Auth .",),
+            command_summaries=("Matched 3 files",),
+            updated_understanding="Auth layer confirmed via grep evidence.",
+            next_investigation_step="Inspect AuthService.java internals.",
+            confidence=0.72,
+        )
+        md = trace.to_markdown()
+        self.assertIn("OBJECTIVE", md)
+        self.assertIn("CURRENT HYPOTHESIS", md)
+        self.assertIn("KNOWN EVIDENCE", md)
+        self.assertIn("COMMANDS RUN", md)
+        self.assertIn("0.72", md)
+
+    def test_agentic_investigator_loop_runs_against_sample_repo(self) -> None:
+        from distillme.investigator import AgenticInvestigatorLoop
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            _write_sample_repo(tmp)
+            executor = CliExecutor(tmp)
+            loop = AgenticInvestigatorLoop(executor)
+            trace = loop.investigate("architecture_overview.md", "architecture package", 0.5)
+            self.assertIsInstance(trace, InvestigationTrace)
+            self.assertGreater(len(trace.commands_run), 0)
+
+    def test_dataset_records_include_investigation_trace_for_agentic_categories(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            repo = tmp_path / "repo"
+            repo.mkdir()
+            _write_sample_repo(repo)
+            config = PipelineConfig.default(repo, tmp_path / "work")
+            DistillationPipeline(config).run(resume=False)
+
+            dataset_path = config.workdir / "dataset/instruction_dataset.jsonl"
+            records = [json.loads(line) for line in dataset_path.read_text(encoding="utf-8").splitlines()]
+            agentic = [r for r in records if r["task_category"] in {"agentic_task", "cli_exploration_task"}]
+            self.assertGreater(len(agentic), 0, "expected agentic/cli_exploration records")
+            for record in agentic:
+                self.assertIn("investigation_trace", record)
+
+    def test_new_task_categories_present_in_dataset(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            repo = tmp_path / "repo"
+            repo.mkdir()
+            _write_sample_repo(repo)
+            config = PipelineConfig.default(repo, tmp_path / "work")
+            DistillationPipeline(config).run(resume=False)
+
+            dataset_path = config.workdir / "dataset/instruction_dataset.jsonl"
+            records = [json.loads(line) for line in dataset_path.read_text(encoding="utf-8").splitlines()]
+            categories = {r["task_category"] for r in records}
+            self.assertIn("cli_exploration_task", categories)
+            self.assertIn("multi_hop_navigation_task", categories)
 
 
 if __name__ == "__main__":
