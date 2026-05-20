@@ -25,6 +25,9 @@ DEFAULT_EXCLUDE_DIRS = (
 @dataclass(frozen=True)
 class RetrievalConfig:
     vector_backend: str = "local-jsonl"
+    embedding_endpoint: str = "local"
+    embedding_model: str = "local"
+    embedding_api_key: str = ""
     dense_weight: float = 0.45
     sparse_weight: float = 0.35
     symbol_weight: float = 0.20

@@ -1,4 +1,19 @@
-"""Hybrid retrieval over local indexes with dense, sparse, and symbol signals."""
+"""Hybrid retrieval over local indexes with dense, sparse, and symbol signals.
+
+Provides two retrieval backends:
+
+* :class:`HybridRetriever` — fully deterministic, no external dependencies;
+  combines hash-based dense projection, BM25 approximate sparse scoring, and
+  symbol overlap.
+
+* :class:`ChromaRetriever` — ChromaDB-backed vector store with real embedding
+  support via :class:`~distillme.embedding.EmbeddingClient`.  Requires
+  ``chromadb`` (``pip install 'distillme[chroma]'``).  Chunks are indexed
+  lazily on the first query by reading the JSONL produced by the ingest stage.
+
+Use :func:`make_retriever` to obtain the appropriate backend based on the
+configured :attr:`~distillme.config.RetrievalConfig.vector_backend`.
+"""
 
 from __future__ import annotations
 
@@ -8,9 +23,13 @@ import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import TYPE_CHECKING, Any, Iterable
 
 from distillme.schemas import Chunk
+
+if TYPE_CHECKING:
+    from distillme.config import RetrievalConfig
+    from distillme.embedding import EmbeddingClient
 
 _TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]+")
 
@@ -142,3 +161,195 @@ def _cosine(left: list[float], right: list[float]) -> float:
     if left_norm == 0 or right_norm == 0:
         return 0.0
     return max(numerator / (left_norm * right_norm), 0.0)
+
+
+# ---------------------------------------------------------------------------
+# ChromaDB-backed vector retriever
+# ---------------------------------------------------------------------------
+
+
+class ChromaRetriever:
+    """ChromaDB-backed vector retriever with real embedding support.
+
+    Chunks produced by the ingest stage (written to ``chunks.jsonl``) are
+    indexed into a persistent ChromaDB collection on the *first* call to
+    :meth:`search`.  Subsequent calls reuse the stored collection, making
+    resume-safe across pipeline runs.
+
+    Requires ``chromadb`` to be installed::
+
+        pip install 'distillme[chroma]'
+
+    Parameters
+    ----------
+    index_dir:
+        Directory that contains the ``chunks.jsonl`` written by the ingest
+        stage.  The ChromaDB data is stored in a ``chroma/`` subdirectory.
+    embedding_client:
+        Client used to produce embedding vectors for both indexing and queries.
+    collection_name:
+        Name of the ChromaDB collection.  Change this only when running
+        multiple independent indexes in the same workdir.
+    """
+
+    def __init__(
+        self,
+        index_dir: Path,
+        embedding_client: "EmbeddingClient",
+        collection_name: str = "distillme_chunks",
+    ) -> None:
+        self.index_dir = index_dir
+        self.embedding_client = embedding_client
+        self.collection_name = collection_name
+        self._chroma_client: Any = None
+        self._collection: Any = None
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    def search(self, query: str, top_k: int = 8) -> list[RetrievalHit]:
+        """Return the *top_k* most relevant chunks for *query*."""
+        self._ensure_indexed()
+        count = self._collection.count()
+        if count == 0:
+            return []
+        n = min(top_k, count)
+        results = self._collection.query(
+            query_texts=[query],
+            n_results=n,
+            include=["documents", "metadatas", "distances"],
+        )
+        hits: list[RetrievalHit] = []
+        for doc, meta, dist in zip(
+            results["documents"][0],
+            results["metadatas"][0],
+            results["distances"][0],
+        ):
+            # ChromaDB returns L2 or cosine distances; convert to a 0-1 similarity.
+            score = max(0.0, 1.0 - float(dist))
+            chunk = Chunk(
+                chunk_id=meta.get("chunk_id", ""),
+                artifact_id=meta.get("artifact_id", ""),
+                path=meta["path"],
+                kind=meta["kind"],
+                language=meta["language"],
+                start_line=int(meta["start_line"]),
+                end_line=int(meta["end_line"]),
+                text=doc,
+                symbols=tuple(s for s in meta.get("symbols", "").split(",") if s),
+            )
+            hits.append(RetrievalHit(chunk=chunk, score=score, reasons=("vector_similarity",)))
+        return hits
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _ensure_indexed(self) -> None:
+        """Lazily initialise and populate the ChromaDB collection."""
+        if self._collection is not None:
+            return
+        try:
+            import chromadb  # type: ignore[import]
+            from chromadb import EmbeddingFunction, Documents, Embeddings  # type: ignore[import]
+        except ImportError as exc:
+            raise ImportError(
+                "ChromaDB is required for vector_backend='chroma'. "
+                "Install it with: pip install 'distillme[chroma]'"
+            ) from exc
+
+        embedding_client = self.embedding_client
+
+        class _DistillmeEmbeddingFunction(EmbeddingFunction[Documents]):  # type: ignore[misc]
+            def __init__(self) -> None:
+                pass  # suppress deprecation warning; no external state needed
+
+            @staticmethod
+            def name() -> str:
+                return "distillme"
+
+            def get_config(self) -> dict:  # type: ignore[override]
+                return {"name": "distillme"}
+
+            @classmethod
+            def build_from_config(cls, config: dict) -> "_DistillmeEmbeddingFunction":  # type: ignore[override]
+                return cls()
+
+            def __call__(self, input: Documents) -> Embeddings:  # type: ignore[override]  # noqa: A002
+                return embedding_client.embed(list(input))
+
+        persist_dir = self.index_dir / "chroma"
+        persist_dir.mkdir(parents=True, exist_ok=True)
+        self._chroma_client = chromadb.PersistentClient(path=str(persist_dir))
+        self._collection = self._chroma_client.get_or_create_collection(
+            name=self.collection_name,
+            embedding_function=_DistillmeEmbeddingFunction(),
+            metadata={"hnsw:space": "cosine"},
+        )
+        if self._collection.count() == 0:
+            self._populate_from_jsonl()
+
+    def _populate_from_jsonl(self) -> None:
+        """Read ``chunks.jsonl`` and add all chunks to the collection in batches."""
+        chunks = _load_chunks(self.index_dir / "chunks.jsonl")
+        if not chunks:
+            return
+        batch_size = 100
+        for offset in range(0, len(chunks), batch_size):
+            batch = chunks[offset : offset + batch_size]
+            self._collection.add(
+                ids=[chunk.chunk_id for chunk in batch],
+                documents=[chunk.text for chunk in batch],
+                metadatas=[
+                    {
+                        "chunk_id": chunk.chunk_id,
+                        "artifact_id": chunk.artifact_id,
+                        "path": chunk.path,
+                        "kind": chunk.kind,
+                        "language": chunk.language,
+                        "start_line": chunk.start_line,
+                        "end_line": chunk.end_line,
+                        "symbols": ",".join(chunk.symbols),
+                    }
+                    for chunk in batch
+                ],
+            )
+
+
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
+
+
+def make_retriever(
+    retrieval_config: "RetrievalConfig",
+    index_dir: Path,
+) -> "HybridRetriever | ChromaRetriever":
+    """Return the retrieval backend specified by *retrieval_config*.
+
+    * ``vector_backend = "local-jsonl"`` (default) → :class:`HybridRetriever`
+    * ``vector_backend = "chroma"`` → :class:`ChromaRetriever`
+
+    The embedding client for the Chroma backend is constructed from the
+    ``embedding_endpoint``, ``embedding_model``, and ``embedding_api_key``
+    fields in *retrieval_config* via
+    :func:`~distillme.embedding.make_embedding_client`.
+    """
+    if retrieval_config.vector_backend == "chroma":
+        from distillme.embedding import make_embedding_client
+
+        embedding_client = make_embedding_client(
+            endpoint=retrieval_config.embedding_endpoint,
+            model=retrieval_config.embedding_model,
+            api_key=retrieval_config.embedding_api_key,
+        )
+        return ChromaRetriever(index_dir=index_dir, embedding_client=embedding_client)
+
+    return HybridRetriever(
+        index_dir=index_dir,
+        dense_weight=retrieval_config.dense_weight,
+        sparse_weight=retrieval_config.sparse_weight,
+        symbol_weight=retrieval_config.symbol_weight,
+    )
+

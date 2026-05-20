@@ -17,6 +17,19 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
 ]
 
+[project.optional-dependencies]
+# ChromaDB vector store and persistent embedding index.
+# Enables vector_backend = "chroma" in the retrieval configuration.
+chroma = ["chromadb>=1.0.0"]
+
+# sentence-transformers provides local neural embedding models.
+# Use with HttpEmbeddingClient pointed at a local text-embeddings-inference
+# or Ollama server, or embed directly in Python code.
+sentence-transformers = ["sentence-transformers>=2.2.0"]
+
+# Install all optional extras together.
+all = ["chromadb>=1.0.0", "sentence-transformers>=2.2.0"]
+
 [project.scripts]
 distillme = "distillme.cli:main"
 
