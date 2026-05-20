@@ -10,11 +10,11 @@ from typing import Callable
 
 from distillme.cli_tools import CliExecutor
 from distillme.config import PipelineConfig
-from distillme.inference import make_client
+from distillme.inference import make_exclusive_client
 from distillme.ingestion import RepositoryIngestor
 from distillme.investigator import InvestigatorAgent
 from distillme.observability import TraceLogger
-from distillme.retrieval import HybridRetriever
+from distillme.retrieval import ChromaRetriever, HybridRetriever, make_retriever
 from distillme.schemas import PipelinePaths, StageName, StageResult
 from distillme.teacher import TeacherAgent
 from distillme.training import EvaluationPlanner, StudentTrainingPlanner
@@ -68,9 +68,9 @@ class DistillationPipeline:
         if stage == "ingest":
             return RepositoryIngestor(self.config, self.paths).run
         if stage == "investigate":
-            return InvestigatorAgent(self.paths, self._retriever(), make_client(self.config.investigator), self._cli).run
+            return InvestigatorAgent(self.paths, self._retriever(), make_exclusive_client(self.config.investigator), self._cli).run
         if stage == "teach":
-            return TeacherAgent(self.paths, self._retriever(), make_client(self.config.teacher), self._cli).run
+            return TeacherAgent(self.paths, self._retriever(), make_exclusive_client(self.config.teacher), self._cli).run
         if stage == "validate":
             return ValidationPipeline(self.paths).run
         if stage == "train":
@@ -79,14 +79,8 @@ class DistillationPipeline:
             return EvaluationPlanner(self.paths).run
         raise ValueError(f"unknown stage: {stage}")
 
-    def _retriever(self) -> HybridRetriever:
-        retrieval = self.config.retrieval
-        return HybridRetriever(
-            self.paths.index_dir,
-            dense_weight=retrieval.dense_weight,
-            sparse_weight=retrieval.sparse_weight,
-            symbol_weight=retrieval.symbol_weight,
-        )
+    def _retriever(self) -> "HybridRetriever | ChromaRetriever":
+        return make_retriever(self.config.retrieval, self.paths.index_dir)
 
     def _load_state(self) -> dict[str, dict[str, object]]:
         if not self.state_path.exists():

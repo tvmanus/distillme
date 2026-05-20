@@ -9,10 +9,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from distillme.cli_tools import CliExecutor, CliResult
-from distillme.config import PipelineConfig
-from distillme.inference import HttpLLMClient, LLMClient, StubLLMClient, make_client
+from distillme.config import PipelineConfig, RetrievalConfig
+from distillme.embedding import (
+    EmbeddingClient,
+    HttpEmbeddingClient,
+    StubEmbeddingClient,
+    make_embedding_client,
+)
+from distillme.inference import ExclusiveLLMClient, HttpLLMClient, LLMClient, StubLLMClient, make_client
 from distillme.orchestration import STAGES, DistillationPipeline
-from distillme.retrieval import HybridRetriever
+from distillme.retrieval import ChromaRetriever, HybridRetriever, make_retriever
 from distillme.schemas import InvestigationTrace, ModelSpec
 from distillme.teacher import DIFFICULTIES, TASK_CATEGORIES
 
@@ -72,6 +78,47 @@ class InferenceTests(unittest.TestCase):
     def test_llm_client_is_abstract(self) -> None:
         with self.assertRaises(TypeError):
             LLMClient()  # type: ignore[abstract]
+
+    def test_exclusive_client_delegates_to_inner(self) -> None:
+        spec = ModelSpec(role="investigator", family="gemini", model="m", endpoint="local")
+        inner = StubLLMClient(spec)
+        exclusive = ExclusiveLLMClient(inner)
+        result = exclusive.generate("sys", "user")
+        self.assertEqual(result, inner.generate("sys", "user"))
+
+    def test_exclusive_client_enforces_single_llm_at_a_time(self) -> None:
+        """Two ExclusiveLLMClient instances sharing the same lock cannot overlap."""
+        import threading
+
+        from distillme.inference import _PIPELINE_LLM_LOCK
+
+        spec = ModelSpec(role="investigator", family="gemini", model="m", endpoint="local")
+        inner = StubLLMClient(spec)
+        client_a = ExclusiveLLMClient(inner)
+        client_b = ExclusiveLLMClient(inner)
+
+        results: list[str] = []
+        errors: list[Exception] = []
+
+        def call_a() -> None:
+            try:
+                results.append(client_a.generate("sys", "a"))
+            except Exception as exc:  # pragma: no cover
+                errors.append(exc)
+
+        def call_b() -> None:
+            try:
+                results.append(client_b.generate("sys", "b"))
+            except Exception as exc:  # pragma: no cover
+                errors.append(exc)
+
+        threads = [threading.Thread(target=call_a), threading.Thread(target=call_b)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertFalse(errors)
+        self.assertEqual(len(results), 2)
 
 
 class PipelineTests(unittest.TestCase):
@@ -159,6 +206,87 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(hits[0].chunk.path.endswith("Greeter.java"))
             self.assertGreater(hits[0].score, 0)
             self.assertIn("greet", hits[0].chunk.text)
+
+
+class EmbeddingTests(unittest.TestCase):
+    def test_stub_embedding_returns_normalised_vectors(self) -> None:
+        client = StubEmbeddingClient()
+        vectors = client.embed(["hello world", "java class service"])
+        self.assertEqual(len(vectors), 2)
+        for vec in vectors:
+            self.assertIsInstance(vec, list)
+            self.assertEqual(len(vec), 384)
+            norm = sum(v * v for v in vec) ** 0.5
+            self.assertAlmostEqual(norm, 1.0, places=5)
+
+    def test_stub_embedding_is_deterministic(self) -> None:
+        client = StubEmbeddingClient()
+        self.assertEqual(client.embed(["test"]), client.embed(["test"]))
+
+    def test_stub_embedding_differs_for_different_texts(self) -> None:
+        client = StubEmbeddingClient()
+        a = client.embed(["architecture overview"])
+        b = client.embed(["exception taxonomy"])
+        self.assertNotEqual(a, b)
+
+    def test_stub_embedding_client_is_abstract_base_satisfied(self) -> None:
+        self.assertIsInstance(StubEmbeddingClient(), EmbeddingClient)
+
+    def test_http_embedding_client_is_instantiable(self) -> None:
+        client = HttpEmbeddingClient(endpoint="http://localhost:8080", model="text-embedding-3-small")
+        self.assertEqual(client.endpoint, "http://localhost:8080")
+        self.assertEqual(client.model, "text-embedding-3-small")
+
+    def test_make_embedding_client_returns_stub_for_local(self) -> None:
+        self.assertIsInstance(make_embedding_client("local"), StubEmbeddingClient)
+        self.assertIsInstance(make_embedding_client(), StubEmbeddingClient)
+
+    def test_make_embedding_client_returns_http_for_http_endpoint(self) -> None:
+        client = make_embedding_client("http://localhost:8080", model="nomic-embed-text")
+        self.assertIsInstance(client, HttpEmbeddingClient)
+
+    def test_retrieval_config_embedding_fields_default(self) -> None:
+        from distillme.config import RetrievalConfig as RC
+
+        rc = RC()
+        self.assertEqual(rc.embedding_endpoint, "local")
+        self.assertEqual(rc.embedding_model, "local")
+        self.assertEqual(rc.embedding_api_key, "")
+
+    def test_make_retriever_returns_hybrid_for_local_jsonl(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            index_dir = Path(directory)
+            rc = RetrievalConfig(vector_backend="local-jsonl")
+            retriever = make_retriever(rc, index_dir)
+            self.assertIsInstance(retriever, HybridRetriever)
+
+    def test_make_retriever_returns_chroma_for_chroma_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            index_dir = Path(directory)
+            rc = RetrievalConfig(vector_backend="chroma")
+            retriever = make_retriever(rc, index_dir)
+            self.assertIsInstance(retriever, ChromaRetriever)
+
+    def test_chroma_retriever_searches_after_ingest(self) -> None:
+        """ChromaRetriever should find chunks after the pipeline writes chunks.jsonl."""
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            repo = tmp_path / "repo"
+            repo.mkdir()
+            _write_sample_repo(repo)
+            config = PipelineConfig.default(repo, tmp_path / "work")
+            from distillme.ingestion import RepositoryIngestor
+            from distillme.schemas import PipelinePaths
+
+            paths = PipelinePaths.from_root(repo, tmp_path / "work")
+            RepositoryIngestor(config, paths).run()
+
+            embedding_client = StubEmbeddingClient()
+            retriever = ChromaRetriever(index_dir=paths.index_dir, embedding_client=embedding_client)
+            hits = retriever.search("Greeter greet", top_k=3)
+            self.assertIsInstance(hits, list)
+            self.assertGreater(len(hits), 0)
+            self.assertGreater(hits[0].score, 0.0)
 
 
 class CliToolsTests(unittest.TestCase):

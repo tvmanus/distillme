@@ -4,10 +4,17 @@ from __future__ import annotations
 
 import abc
 import json
+import threading
 import urllib.error
 import urllib.request
 
 from distillme.schemas import ModelSpec
+
+# Module-level lock shared by all :class:`ExclusiveLLMClient` instances.
+# Ensures that at most one LLM ``generate()`` call is executing at any time
+# across the entire pipeline process.  Embedding clients are exempt from
+# this constraint and may be called concurrently.
+_PIPELINE_LLM_LOCK = threading.Lock()
 
 
 class LLMClient(abc.ABC):
@@ -93,3 +100,38 @@ def make_client(spec: ModelSpec) -> LLMClient:
     if spec.endpoint.startswith(("http://", "https://")):
         return HttpLLMClient(spec)
     return StubLLMClient(spec)
+
+
+class ExclusiveLLMClient(LLMClient):
+    """Wraps any :class:`LLMClient` to enforce single-LLM-at-a-time execution.
+
+    Acquires :data:`_PIPELINE_LLM_LOCK` before delegating to the wrapped
+    client and releases it after the call returns.  This guarantees that no
+    two LLM ``generate()`` calls overlap within the same process, regardless
+    of threading.
+
+    Embedding clients (:class:`~distillme.embedding.EmbeddingClient`) are
+    exempt from this lock and may be called at any time.
+
+    Parameters
+    ----------
+    inner:
+        The underlying :class:`LLMClient` to delegate to.
+    """
+
+    def __init__(self, inner: LLMClient) -> None:
+        self._inner = inner
+
+    def generate(self, system: str, user: str, max_tokens: int = 2048) -> str:
+        with _PIPELINE_LLM_LOCK:
+            return self._inner.generate(system, user, max_tokens)
+
+
+def make_exclusive_client(spec: ModelSpec) -> ExclusiveLLMClient:
+    """Return an :class:`ExclusiveLLMClient` wrapping the client for *spec*.
+
+    Convenience wrapper combining :func:`make_client` with
+    :class:`ExclusiveLLMClient` so all pipeline LLM calls automatically
+    respect the single-LLM exclusivity guarantee.
+    """
+    return ExclusiveLLMClient(make_client(spec))
