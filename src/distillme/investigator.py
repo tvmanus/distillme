@@ -364,7 +364,8 @@ class AgenticInvestigatorLoop:
             # Strip optional markdown code fence.
             if text.startswith("```"):
                 parts = text.split("```", 2)
-                text = parts[1][4:] if parts[1].startswith("json") else parts[1]
+                body = parts[1] if len(parts) > 1 else ""
+                text = body[4:] if body.startswith("json") else body
             data = json.loads(text)
             rationale = str(data.get("rationale", "")).strip()
             raw_cmds = data.get("commands", [])
