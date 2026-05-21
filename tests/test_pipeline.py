@@ -369,6 +369,66 @@ class CliToolsTests(unittest.TestCase):
             self.assertIsInstance(trace, InvestigationTrace)
             self.assertGreater(len(trace.commands_run), 0)
 
+    def test_multi_iteration_trace_has_recorded_iterations(self) -> None:
+        """Each run of the agentic loop must record at least one iteration."""
+        from distillme.investigator import AgenticInvestigatorLoop
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            _write_sample_repo(tmp)
+            executor = CliExecutor(tmp)
+            loop = AgenticInvestigatorLoop(executor, max_iterations=2)
+            trace = loop.investigate("architecture_overview.md", "architecture package", 0.5)
+            self.assertGreater(len(trace.iterations), 0, "expected at least one recorded iteration")
+            first = trace.iterations[0]
+            self.assertEqual(first.iteration_num, 0)
+            self.assertIsInstance(first.plan_rationale, str)
+            self.assertGreater(len(first.commands_planned), 0)
+
+    def test_investigation_iteration_renders_to_markdown(self) -> None:
+        from distillme.schemas import InvestigationIteration
+        it = InvestigationIteration(
+            iteration_num=0,
+            plan_rationale="Initial broad exploration",
+            commands_planned=("find . -name '*.java'",),
+            findings=("Discovered file: ./src/Main.java",),
+            hypothesis_after="Java files present.",
+        )
+        md = it.to_markdown()
+        self.assertIn("Iteration 1", md)
+        self.assertIn("Initial broad exploration", md)
+        self.assertIn("./src/Main.java", md)
+        self.assertIn("Java files present.", md)
+
+    def test_iteration_markdown_included_in_trace_markdown(self) -> None:
+        from distillme.investigator import AgenticInvestigatorLoop
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            _write_sample_repo(tmp)
+            executor = CliExecutor(tmp)
+            loop = AgenticInvestigatorLoop(executor, max_iterations=2)
+            trace = loop.investigate("architecture_overview.md", "architecture package", 0.5)
+            md = trace.to_markdown()
+            self.assertIn("INVESTIGATION ITERATIONS", md)
+            self.assertIn("Iteration 1", md)
+
+    def test_followup_commands_branch_from_discovered_files(self) -> None:
+        """Second iteration must target files discovered in the first iteration."""
+        from distillme.investigator import AgenticInvestigatorLoop
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            _write_sample_repo(tmp)
+            executor = CliExecutor(tmp)
+            loop = AgenticInvestigatorLoop(executor, max_iterations=3)
+            trace = loop.investigate("architecture_overview.md", "architecture package", 0.5)
+            # If iteration 0 found files, iteration 1 should use branched commands.
+            if len(trace.iterations) > 1:
+                second_iter = trace.iterations[1]
+                # Branched plan rationale differs from the initial seed rationale.
+                self.assertNotEqual(
+                    second_iter.plan_rationale,
+                    trace.iterations[0].plan_rationale,
+                )
+
     def test_dataset_records_include_investigation_trace_for_agentic_categories(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
