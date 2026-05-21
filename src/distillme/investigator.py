@@ -21,6 +21,13 @@ _INVESTIGATOR_SYSTEM = (
     "Mark uncertainty explicitly. Do not fabricate class names, APIs, or runtime behavior."
 )
 
+# System prompt for the LLM-backed plan step in the two-step investigation loop.
+_THINK_STEP_SYSTEM = (
+    "You are a methodical codebase investigator planning the next CLI investigation step. "
+    "Analyse the current evidence and decide exactly what to investigate next. "
+    "Respond ONLY with a valid JSON object — no prose outside the JSON."
+)
+
 MANDATORY_DOCUMENTS = (
     "architecture_overview.md",
     "service_catalog.md",
@@ -214,11 +221,13 @@ class AgenticInvestigatorLoop:
     1. **Plan step** — the agent reviews evidence accumulated so far and
        decides which CLI commands to run next.  On the first iteration the
        static per-topic command list from :data:`_TOPIC_CLI_COMMANDS` is used
-       as the seed.  On subsequent iterations :meth:`_derive_followup_commands`
-       performs *intelligent branching*: it extracts concrete file paths and
-       symbol names from the evidence gathered so far and generates targeted
-       follow-up commands (e.g. inspecting the internals of discovered source
-       files, listing sibling directories, or examining git history).
+       as the seed.  On subsequent iterations the plan step performs
+       *intelligent branching*: when an LLM client is provided it reasons over
+       the accumulated evidence and returns a structured list of targeted
+       follow-up commands; when no LLM is configured,
+       :meth:`_derive_followup_commands` applies a heuristic strategy —
+       inspecting symbols in discovered source files, listing sibling
+       directories, or examining git history.
 
     2. **Execute step** — each planned command is run via the
        :class:`~distillme.cli_tools.CliExecutor`; output is parsed into
@@ -232,9 +241,15 @@ class AgenticInvestigatorLoop:
     and attached to the returned :class:`~distillme.schemas.InvestigationTrace`.
     """
 
-    def __init__(self, cli: "CliExecutor", max_iterations: int = 3) -> None:
+    def __init__(
+        self,
+        cli: "CliExecutor",
+        max_iterations: int = 3,
+        llm_client: "LLMClient | None" = None,
+    ) -> None:
         self.cli = cli
         self.max_iterations = max_iterations
+        self._llm_client = llm_client
 
     def investigate(self, document: str, query: str, retrieval_confidence: float) -> InvestigationTrace:
         """Perform multi-iteration CLI exploration for *document* and return a structured trace."""
@@ -292,7 +307,9 @@ class AgenticInvestigatorLoop:
         """Return the next batch of commands to execute.
 
         Iteration 0 uses the static per-topic seed commands.  Later iterations
-        branch intelligently from the evidence accumulated so far.
+        branch intelligently: when an LLM client is configured
+        :meth:`_plan_step_llm` is attempted first; on failure (or when no LLM
+        is available) the heuristic :meth:`_derive_followup_commands` is used.
         """
         if iteration == 0:
             cmds = list(_TOPIC_CLI_COMMANDS.get(document, _DEFAULT_CLI_COMMANDS))
@@ -303,6 +320,63 @@ class AgenticInvestigatorLoop:
                 ),
                 commands=cmds,
             )
+        if self._llm_client is not None:
+            return self._plan_step_llm(memory, document, iteration)
+        return self._derive_followup_commands(memory, document, iteration)
+
+    def _plan_step_llm(
+        self, memory: InvestigationMemory, document: str, iteration: int
+    ) -> _InvestigationPlan:
+        """Use the LLM to reason about the next investigation step.
+
+        Builds a structured prompt from the current evidence state, requests a
+        JSON response containing a rationale and a list of CLI commands, then
+        validates the output before constructing an :class:`_InvestigationPlan`.
+        Falls back to :meth:`_derive_followup_commands` when the LLM returns
+        unparseable or invalid output.
+        """
+        topic = document.removesuffix(".md").replace("_", " ")
+        evidence_str = (
+            "\n".join(f"  - {e}" for e in memory.evidence[-8:]) or "  - None gathered"
+        )
+        commands_str = (
+            "\n".join(f"  - {c}" for c in memory.commands_run[-5:]) or "  - None"
+        )
+        user_prompt = (
+            f"Topic: {topic}\n"
+            f"Iteration: {iteration + 1}\n"
+            f"Current hypothesis: {memory.hypothesis}\n"
+            f"Evidence gathered ({len(memory.evidence)} items):\n{evidence_str}\n"
+            f"Commands already run:\n{commands_str}\n\n"
+            "Decide the next investigation step. Respond with JSON only:\n"
+            "{\n"
+            '  "rationale": "<1-2 sentences on what to investigate next>",\n'
+            '  "commands": [["grep", "-En", "class|interface", "./path/File.java"]]\n'
+            "}\n\n"
+            "Rules:\n"
+            "- commands: 0-4 entries using only: find, grep, git, ls, cat, head, wc\n"
+            "- Target specific files or patterns discovered in the evidence above\n"
+            "- If investigation is complete, use [] for commands"
+        )
+        try:
+            raw = self._llm_client.generate(_THINK_STEP_SYSTEM, user_prompt, max_tokens=512)
+            text = raw.strip()
+            # Strip optional markdown code fence.
+            if text.startswith("```"):
+                parts = text.split("```", 2)
+                text = parts[1][4:] if parts[1].startswith("json") else parts[1]
+            data = json.loads(text)
+            rationale = str(data.get("rationale", "")).strip()
+            raw_cmds = data.get("commands", [])
+            validated: list[list[str]] = []
+            for cmd in raw_cmds[:4]:
+                if isinstance(cmd, list) and cmd:
+                    validated.append([str(a) for a in cmd])
+            if rationale and validated:
+                return _InvestigationPlan(rationale=f"[LLM] {rationale}", commands=validated)
+        except (json.JSONDecodeError, KeyError, ValueError):
+            pass
+        # LLM returned unparseable or empty output; use heuristic fallback.
         return self._derive_followup_commands(memory, document, iteration)
 
     @staticmethod
@@ -424,7 +498,8 @@ class InvestigatorAgent:
         self.llm_client = llm_client
         self.cli_executor = cli_executor
         self._agentic_loop: AgenticInvestigatorLoop | None = (
-            AgenticInvestigatorLoop(cli_executor) if cli_executor is not None else None
+            AgenticInvestigatorLoop(cli_executor, llm_client=llm_client)
+            if cli_executor is not None else None
         )
 
     def run(self) -> dict[str, int]:

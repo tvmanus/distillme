@@ -433,6 +433,49 @@ class CliToolsTests(unittest.TestCase):
                 trace.iterations[0].plan_rationale,
             )
 
+    def test_agentic_loop_llm_fallback_on_invalid_json(self) -> None:
+        """StubLLMClient returns plain text (not JSON); loop must fall back to heuristic."""
+        from distillme.investigator import AgenticInvestigatorLoop
+        spec = ModelSpec(role="investigator", family="gemini", model="gemini-stub", endpoint="local")
+        stub_llm = StubLLMClient(spec)
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            _write_sample_repo(tmp)
+            executor = CliExecutor(tmp)
+            loop = AgenticInvestigatorLoop(executor, max_iterations=2, llm_client=stub_llm)
+            trace = loop.investigate("testing_strategy.md", "test unit integration", 0.4)
+            self.assertIsInstance(trace, InvestigationTrace)
+            # Loop must complete and record at least one iteration even with stub LLM.
+            self.assertGreater(len(trace.iterations), 0)
+
+    def test_agentic_loop_with_valid_llm_json_uses_llm_plan(self) -> None:
+        """When the LLM returns valid JSON, the plan rationale is prefixed with [LLM]."""
+        from distillme.investigator import AgenticInvestigatorLoop
+
+        class _ValidJsonLLM(LLMClient):
+            """Stub that always returns a parseable JSON plan."""
+
+            def generate(self, system: str, user: str, max_tokens: int = 2048) -> str:
+                return json.dumps({
+                    "rationale": "Inspect discovered Java files for package declarations.",
+                    "commands": [["grep", "-En", "^package ", "./src/main/java/com/example/Greeter.java"]],
+                })
+
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            _write_sample_repo(tmp)
+            executor = CliExecutor(tmp)
+            loop = AgenticInvestigatorLoop(executor, max_iterations=2, llm_client=_ValidJsonLLM())
+            trace = loop.investigate("architecture_overview.md", "architecture package", 0.5)
+            self.assertIsInstance(trace, InvestigationTrace)
+            self.assertGreater(len(trace.iterations), 1)
+            # The follow-up iteration rationale should carry the [LLM] prefix.
+            second_rationale = trace.iterations[1].plan_rationale
+            self.assertTrue(
+                second_rationale.startswith("[LLM]"),
+                f"Expected '[LLM]' prefix in follow-up rationale, got: {second_rationale!r}",
+            )
+
     def test_dataset_records_include_investigation_trace_for_agentic_categories(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
