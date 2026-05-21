@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from distillme.retrieval import RetrievalHit
 from distillme.retrieval import HybridRetriever
-from distillme.schemas import Finding, InvestigationTrace, PipelinePaths
+from distillme.schemas import Finding, InvestigationIteration, InvestigationTrace, PipelinePaths
 
 if TYPE_CHECKING:
     from distillme.cli_tools import CliExecutor, CliResult
@@ -18,6 +19,13 @@ _INVESTIGATOR_SYSTEM = (
     "You are an expert software archaeologist performing deep codebase analysis. "
     "All claims must be grounded in the retrieved source evidence provided. "
     "Mark uncertainty explicitly. Do not fabricate class names, APIs, or runtime behavior."
+)
+
+# System prompt for the LLM-backed plan step in the two-step investigation loop.
+_THINK_STEP_SYSTEM = (
+    "You are a methodical codebase investigator planning the next CLI investigation step. "
+    "Analyse the current evidence and decide exactly what to investigate next. "
+    "Respond ONLY with a valid JSON object — no prose outside the JSON."
 )
 
 MANDATORY_DOCUMENTS = (
@@ -127,11 +135,23 @@ _TOPIC_CLI_COMMANDS: dict[str, list[list[str]]] = {
     ],
 }
 
+_SOURCE_FILE_EXTENSIONS: frozenset[str] = frozenset(
+    {".java", ".py", ".kt", ".go", ".ts", ".js", ".scala", ".cs", ".rb"}
+)
+
 # Default CLI commands used for topics not explicitly mapped above.
 _DEFAULT_CLI_COMMANDS: list[list[str]] = [
     ["find", ".", "-name", "*.java", "-type", "f"],
     ["find", ".", "-name", "*.gradle", "-type", "f"],
 ]
+
+
+@dataclasses.dataclass
+class _InvestigationPlan:
+    """Internal value-object produced by the planning step of one iteration."""
+
+    rationale: str
+    commands: list[list[str]]
 
 
 class InvestigationMemory:
@@ -165,7 +185,12 @@ class InvestigationMemory:
     def refine_hypothesis(self, new_hypothesis: str) -> None:
         self.hypothesis = new_hypothesis
 
-    def to_trace(self, objective: str, confidence: float) -> InvestigationTrace:
+    def to_trace(
+        self,
+        objective: str,
+        confidence: float,
+        iterations: list[InvestigationIteration] | None = None,
+    ) -> InvestigationTrace:
         understanding = self.updated_understanding or (
             f"Completed CLI-assisted investigation of {self.topic}. "
             "Findings are grounded in executed command output and RAG-retrieved chunks."
@@ -183,50 +208,238 @@ class InvestigationMemory:
                 "model-driven analysis before high-confidence training use."
             ),
             confidence=confidence,
+            iterations=tuple(iterations) if iterations else (),
         )
 
 
 class AgenticInvestigatorLoop:
     """Runs iterative CLI-assisted exploration for a single document topic.
 
-    The loop mirrors the investigative workflow of a senior engineer working
-    from a terminal:
+    The loop implements a two-step **plan → execute** cycle repeated for up to
+    *max_iterations* rounds:
 
-    1. Identify relevant CLI commands for the topic.
-    2. Execute each command against the repository.
-    3. Parse output to extract file lists, symbol occurrences, or patterns.
-    4. Accumulate findings into :class:`InvestigationMemory`.
-    5. Refine the working hypothesis based on discovered evidence.
-    6. Return a fully-populated :class:`InvestigationTrace`.
+    1. **Plan step** — the agent reviews evidence accumulated so far and
+       decides which CLI commands to run next.  On the first iteration the
+       static per-topic command list from :data:`_TOPIC_CLI_COMMANDS` is used
+       as the seed.  On subsequent iterations the plan step performs
+       *intelligent branching*: when an LLM client is provided it reasons over
+       the accumulated evidence and returns a structured list of targeted
+       follow-up commands; when no LLM is configured,
+       :meth:`_derive_followup_commands` applies a heuristic strategy —
+       inspecting symbols in discovered source files, listing sibling
+       directories, or examining git history.
+
+    2. **Execute step** — each planned command is run via the
+       :class:`~distillme.cli_tools.CliExecutor`; output is parsed into
+       evidence items and appended to :class:`InvestigationMemory`.
+
+    The working hypothesis is refined after every execute step.  The loop
+    terminates early when an execute step yields no new evidence, avoiding
+    wasted commands.
+
+    Each iteration is recorded as an :class:`~distillme.schemas.InvestigationIteration`
+    and attached to the returned :class:`~distillme.schemas.InvestigationTrace`.
     """
 
-    def __init__(self, cli: "CliExecutor") -> None:
+    def __init__(
+        self,
+        cli: "CliExecutor",
+        max_iterations: int = 3,
+        llm_client: "LLMClient | None" = None,
+    ) -> None:
         self.cli = cli
+        self.max_iterations = max_iterations
+        self._llm_client = llm_client
 
     def investigate(self, document: str, query: str, retrieval_confidence: float) -> InvestigationTrace:
-        """Perform CLI exploration for *document* and return a structured trace."""
+        """Perform multi-iteration CLI exploration for *document* and return a structured trace."""
         memory = InvestigationMemory(document)
         objective = (
             f"Investigate '{document.removesuffix('.md').replace('_', ' ')}' "
             f"using CLI tooling seeded by query: {query!r}"
         )
-        commands = _TOPIC_CLI_COMMANDS.get(document, _DEFAULT_CLI_COMMANDS)
-        for args in commands:
-            try:
-                result = self.cli.run(args)
-            except ValueError:
-                continue
-            summary = result.summary()
-            memory.record_command(result, summary)
-            if result.succeeded and result.stdout.strip():
-                self._extract_evidence(memory, result)
-        self._refine_hypothesis(memory, document)
+        recorded_iterations: list[InvestigationIteration] = []
+
+        for iteration in range(self.max_iterations):
+            # ── Step 1: PLAN ────────────────────────────────────────────────
+            plan = self._plan_step(memory, document, iteration)
+
+            # ── Step 2: EXECUTE ─────────────────────────────────────────────
+            evidence_before = len(memory.evidence)
+            for args in plan.commands:
+                try:
+                    result = self.cli.run(args)
+                except ValueError:
+                    continue
+                summary = result.summary()
+                memory.record_command(result, summary)
+                if result.succeeded and result.stdout.strip():
+                    self._extract_evidence(memory, result)
+
+            new_findings = tuple(memory.evidence[evidence_before:])
+            self._refine_hypothesis(memory, document)
+
+            recorded_iterations.append(
+                InvestigationIteration(
+                    iteration_num=iteration,
+                    plan_rationale=plan.rationale,
+                    commands_planned=tuple(" ".join(c) for c in plan.commands),
+                    findings=new_findings,
+                    hypothesis_after=memory.hypothesis,
+                )
+            )
+
+            # Early-stop: no new findings after the first seed iteration.
+            if iteration > 0 and not new_findings:
+                break
+
         memory.updated_understanding = (
-            f"CLI investigation of '{document}' executed {len(memory.commands_run)} command(s) "
-            f"and gathered {len(memory.evidence)} evidence item(s). "
+            f"Multi-iteration CLI investigation of '{document}' completed "
+            f"{len(recorded_iterations)} iteration(s), executing {len(memory.commands_run)} "
+            f"command(s) and gathering {len(memory.evidence)} evidence item(s). "
             "Findings are combined with vector-retrieved context for final document synthesis."
         )
-        return memory.to_trace(objective, retrieval_confidence)
+        return memory.to_trace(objective, retrieval_confidence, recorded_iterations)
+
+    def _plan_step(
+        self, memory: InvestigationMemory, document: str, iteration: int
+    ) -> _InvestigationPlan:
+        """Return the next batch of commands to execute.
+
+        Iteration 0 uses the static per-topic seed commands.  Later iterations
+        branch intelligently: when an LLM client is configured
+        :meth:`_plan_step_llm` is attempted first; on failure (or when no LLM
+        is available) the heuristic :meth:`_derive_followup_commands` is used.
+        """
+        if iteration == 0:
+            cmds = list(_TOPIC_CLI_COMMANDS.get(document, _DEFAULT_CLI_COMMANDS))
+            return _InvestigationPlan(
+                rationale=(
+                    f"Initial broad exploration of "
+                    f"'{document.removesuffix('.md').replace('_', ' ')}'"
+                ),
+                commands=cmds,
+            )
+        if self._llm_client is not None:
+            return self._plan_step_llm(memory, document, iteration)
+        return self._derive_followup_commands(memory, document, iteration)
+
+    def _plan_step_llm(
+        self, memory: InvestigationMemory, document: str, iteration: int
+    ) -> _InvestigationPlan:
+        """Use the LLM to reason about the next investigation step.
+
+        Builds a structured prompt from the current evidence state, requests a
+        JSON response containing a rationale and a list of CLI commands, then
+        validates the output before constructing an :class:`_InvestigationPlan`.
+        Falls back to :meth:`_derive_followup_commands` when the LLM returns
+        unparseable or invalid output.
+        """
+        topic = document.removesuffix(".md").replace("_", " ")
+        evidence_str = (
+            "\n".join(f"  - {e}" for e in memory.evidence[-8:]) or "  - None gathered"
+        )
+        commands_str = (
+            "\n".join(f"  - {c}" for c in memory.commands_run[-5:]) or "  - None"
+        )
+        user_prompt = (
+            f"Topic: {topic}\n"
+            f"Iteration: {iteration + 1}\n"
+            f"Current hypothesis: {memory.hypothesis}\n"
+            f"Evidence gathered ({len(memory.evidence)} items):\n{evidence_str}\n"
+            f"Commands already run:\n{commands_str}\n\n"
+            "Decide the next investigation step. Respond with JSON only:\n"
+            "{\n"
+            '  "rationale": "<1-2 sentences on what to investigate next>",\n'
+            '  "commands": [["grep", "-En", "class|interface", "./path/File.java"]]\n'
+            "}\n\n"
+            "Rules:\n"
+            "- commands: 0-4 entries using only: find, grep, git, ls, cat, head, wc\n"
+            "- Target specific files or patterns discovered in the evidence above\n"
+            "- If investigation is complete, use [] for commands"
+        )
+        try:
+            raw = self._llm_client.generate(_THINK_STEP_SYSTEM, user_prompt, max_tokens=512)
+            text = raw.strip()
+            # Strip optional markdown code fence.
+            if text.startswith("```"):
+                parts = text.split("```", 2)
+                body = parts[1] if len(parts) > 1 else ""
+                text = body[4:] if body.startswith("json") else body
+            data = json.loads(text)
+            rationale = str(data.get("rationale", "")).strip()
+            raw_cmds = data.get("commands", [])
+            validated: list[list[str]] = []
+            for cmd in raw_cmds[:4]:
+                if isinstance(cmd, list) and cmd:
+                    validated.append([str(a) for a in cmd])
+            if rationale and validated:
+                return _InvestigationPlan(rationale=f"[LLM] {rationale}", commands=validated)
+        except (json.JSONDecodeError, KeyError, ValueError):
+            pass
+        # LLM returned unparseable or empty output; use heuristic fallback.
+        return self._derive_followup_commands(memory, document, iteration)
+
+    @staticmethod
+    def _derive_followup_commands(
+        memory: InvestigationMemory, document: str, iteration: int
+    ) -> _InvestigationPlan:
+        """Generate follow-up commands by branching from accumulated evidence.
+
+        Strategy:
+        - Discovered source files → inspect their symbol structure via grep.
+        - Discovered file paths    → list the parent directory.
+        - Iteration ≥ 2 with no other targets → sample git log for change context.
+        - No targets at all       → repeat the base exploration commands.
+        """
+        commands: list[list[str]] = []
+        rationale_parts: list[str] = []
+
+        # ── Collect discovered file paths from evidence ────────────────────
+        discovered_files: list[str] = []
+        for ev in memory.evidence:
+            for prefix in ("Discovered file: ", "Symbol match in file: "):
+                if ev.startswith(prefix):
+                    path = ev.removeprefix(prefix).strip()
+                    if path not in discovered_files:
+                        discovered_files.append(path)
+
+        # ── Branch 1: inspect symbol structure of discovered source files ──
+        inspected = 0
+        for filepath in discovered_files:
+            suffix = "." + filepath.rsplit(".", 1)[-1] if "." in filepath else ""
+            if suffix in _SOURCE_FILE_EXTENSIONS and inspected < 3:
+                commands.append(
+                    ["grep", "-En", "class|interface|enum|def |func ", filepath]
+                )
+                rationale_parts.append(f"Inspect symbols in {filepath}")
+                inspected += 1
+
+        # ── Branch 2: list parent directories of discovered files ──────────
+        parent_dirs: set[str] = set()
+        for filepath in discovered_files:
+            normalized = filepath.lstrip("./")
+            parts = normalized.split("/")
+            if len(parts) > 1:
+                parent_dirs.add("./" + "/".join(parts[:-1]))
+        for pkg_dir in sorted(parent_dirs)[:2]:
+            commands.append(["ls", pkg_dir])
+            rationale_parts.append(f"List directory {pkg_dir}")
+
+        # ── Branch 3: git log for temporal context on deeper iterations ────
+        if iteration >= 2 and not commands:
+            commands.append(["git", "log", "--oneline", "-10"])
+            rationale_parts.append("Sample git history for change context")
+
+        # ── Fallback: repeat base exploration if no branch targets found ───
+        if not commands:
+            commands = list(_TOPIC_CLI_COMMANDS.get(document, _DEFAULT_CLI_COMMANDS))
+            rationale_parts.append("No branch targets found; repeating base exploration")
+
+        return _InvestigationPlan(
+            rationale="; ".join(rationale_parts),
+            commands=commands,
+        )
 
     @staticmethod
     def _extract_evidence(memory: InvestigationMemory, result: "CliResult") -> None:
@@ -286,7 +499,8 @@ class InvestigatorAgent:
         self.llm_client = llm_client
         self.cli_executor = cli_executor
         self._agentic_loop: AgenticInvestigatorLoop | None = (
-            AgenticInvestigatorLoop(cli_executor) if cli_executor is not None else None
+            AgenticInvestigatorLoop(cli_executor, llm_client=llm_client)
+            if cli_executor is not None else None
         )
 
     def run(self) -> dict[str, int]:

@@ -369,6 +369,113 @@ class CliToolsTests(unittest.TestCase):
             self.assertIsInstance(trace, InvestigationTrace)
             self.assertGreater(len(trace.commands_run), 0)
 
+    def test_multi_iteration_trace_has_recorded_iterations(self) -> None:
+        """Each run of the agentic loop must record at least one iteration."""
+        from distillme.investigator import AgenticInvestigatorLoop
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            _write_sample_repo(tmp)
+            executor = CliExecutor(tmp)
+            loop = AgenticInvestigatorLoop(executor, max_iterations=2)
+            trace = loop.investigate("architecture_overview.md", "architecture package", 0.5)
+            self.assertGreater(len(trace.iterations), 0, "expected at least one recorded iteration")
+            first = trace.iterations[0]
+            self.assertEqual(first.iteration_num, 0)
+            self.assertIsInstance(first.plan_rationale, str)
+            self.assertGreater(len(first.commands_planned), 0)
+
+    def test_investigation_iteration_renders_to_markdown(self) -> None:
+        from distillme.schemas import InvestigationIteration
+        it = InvestigationIteration(
+            iteration_num=0,
+            plan_rationale="Initial broad exploration",
+            commands_planned=("find . -name '*.java'",),
+            findings=("Discovered file: ./src/Main.java",),
+            hypothesis_after="Java files present.",
+        )
+        md = it.to_markdown()
+        self.assertIn("Iteration 1", md)
+        self.assertIn("Initial broad exploration", md)
+        self.assertIn("./src/Main.java", md)
+        self.assertIn("Java files present.", md)
+
+    def test_iteration_markdown_included_in_trace_markdown(self) -> None:
+        from distillme.investigator import AgenticInvestigatorLoop
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            _write_sample_repo(tmp)
+            executor = CliExecutor(tmp)
+            loop = AgenticInvestigatorLoop(executor, max_iterations=2)
+            trace = loop.investigate("architecture_overview.md", "architecture package", 0.5)
+            md = trace.to_markdown()
+            self.assertIn("INVESTIGATION ITERATIONS", md)
+            self.assertIn("Iteration 1", md)
+
+    def test_followup_commands_branch_from_discovered_files(self) -> None:
+        """Second iteration must target files discovered in the first iteration."""
+        from distillme.investigator import AgenticInvestigatorLoop
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            _write_sample_repo(tmp)
+            executor = CliExecutor(tmp)
+            loop = AgenticInvestigatorLoop(executor, max_iterations=3)
+            trace = loop.investigate("architecture_overview.md", "architecture package", 0.5)
+            self.assertGreater(
+                len(trace.iterations),
+                1,
+                "expected multiple iterations to verify branching; only one recorded, "
+                "which indicates the early-stop triggered too soon",
+            )
+            second_iter = trace.iterations[1]
+            # Branched plan rationale must differ from the initial seed rationale.
+            self.assertNotEqual(
+                second_iter.plan_rationale,
+                trace.iterations[0].plan_rationale,
+            )
+
+    def test_agentic_loop_llm_fallback_on_invalid_json(self) -> None:
+        """StubLLMClient returns plain text (not JSON); loop must fall back to heuristic."""
+        from distillme.investigator import AgenticInvestigatorLoop
+        spec = ModelSpec(role="investigator", family="gemini", model="gemini-stub", endpoint="local")
+        stub_llm = StubLLMClient(spec)
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            _write_sample_repo(tmp)
+            executor = CliExecutor(tmp)
+            loop = AgenticInvestigatorLoop(executor, max_iterations=2, llm_client=stub_llm)
+            trace = loop.investigate("testing_strategy.md", "test unit integration", 0.4)
+            self.assertIsInstance(trace, InvestigationTrace)
+            # Loop must complete and record at least one iteration even with stub LLM.
+            self.assertGreater(len(trace.iterations), 0)
+
+    def test_agentic_loop_with_valid_llm_json_uses_llm_plan(self) -> None:
+        """When the LLM returns valid JSON, the plan rationale is prefixed with [LLM]."""
+        from distillme.investigator import AgenticInvestigatorLoop
+
+        class _ValidJsonLLM(LLMClient):
+            """Stub that always returns a parseable JSON plan."""
+
+            def generate(self, system: str, user: str, max_tokens: int = 2048) -> str:
+                return json.dumps({
+                    "rationale": "Inspect discovered Java files for package declarations.",
+                    "commands": [["grep", "-En", "^package ", "./src/main/java/com/example/Greeter.java"]],
+                })
+
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            _write_sample_repo(tmp)
+            executor = CliExecutor(tmp)
+            loop = AgenticInvestigatorLoop(executor, max_iterations=2, llm_client=_ValidJsonLLM())
+            trace = loop.investigate("architecture_overview.md", "architecture package", 0.5)
+            self.assertIsInstance(trace, InvestigationTrace)
+            self.assertGreater(len(trace.iterations), 1)
+            # The follow-up iteration rationale should carry the [LLM] prefix.
+            second_rationale = trace.iterations[1].plan_rationale
+            self.assertTrue(
+                second_rationale.startswith("[LLM]"),
+                f"Expected '[LLM]' prefix in follow-up rationale, got: {second_rationale!r}",
+            )
+
     def test_dataset_records_include_investigation_trace_for_agentic_categories(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)

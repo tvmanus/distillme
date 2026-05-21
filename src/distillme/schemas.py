@@ -93,11 +93,42 @@ class Finding:
 
 
 @dataclass(frozen=True)
+class InvestigationIteration:
+    """Captures one plan→execute iteration of the agentic investigation loop.
+
+    Each iteration consists of two steps:
+
+    1. **Plan** — the agent reviews accumulated evidence and decides which
+       commands to run next, recording its *rationale*.
+    2. **Execute** — the planned commands are run; new *findings* are extracted
+       and the working *hypothesis* is updated.
+    """
+
+    iteration_num: int
+    plan_rationale: str
+    commands_planned: tuple[str, ...]
+    findings: tuple[str, ...]
+    hypothesis_after: str
+
+    def to_markdown(self) -> str:
+        cmds = "\n".join(f"    - `{c}`" for c in self.commands_planned) or "    - none"
+        findings = "\n".join(f"    - {f}" for f in self.findings) or "    - none"
+        return (
+            f"#### Iteration {self.iteration_num + 1}\n\n"
+            f"**Plan:** {self.plan_rationale}\n\n"
+            f"**Commands:**\n{cmds}\n\n"
+            f"**Findings:**\n{findings}\n\n"
+            f"**Hypothesis after:** {self.hypothesis_after}\n"
+        )
+
+
+@dataclass(frozen=True)
 class InvestigationTrace:
     """Structured investigative trace produced by the agentic investigation loop.
 
-    Captures one iteration of the OBJECTIVE → HYPOTHESIS → EVIDENCE → COMMAND →
-    UPDATED-UNDERSTANDING cycle used by the :class:`AgenticInvestigatorLoop`.
+    Captures the full multi-iteration PLAN → EXECUTE cycle used by the
+    :class:`AgenticInvestigatorLoop`.  Each iteration is stored in
+    :attr:`iterations`.  The top-level fields aggregate the complete run.
     """
 
     objective: str
@@ -109,16 +140,22 @@ class InvestigationTrace:
     updated_understanding: str
     next_investigation_step: str
     confidence: float
+    iterations: tuple[InvestigationIteration, ...] = ()
 
     def to_markdown(self) -> str:
         evidence = "\n".join(f"  - {e}" for e in self.known_evidence) or "  - None gathered yet"
         uncerts = "\n".join(f"  - {u}" for u in self.uncertainties) or "  - None identified"
         commands = "\n".join(f"  - `{c}`" for c in self.commands_run) or "  - None executed"
         summaries = "\n".join(f"  - {s}" for s in self.command_summaries) or "  - No output"
+        iter_section = ""
+        if self.iterations:
+            iter_bodies = "\n".join(it.to_markdown() for it in self.iterations)
+            iter_section = f"**INVESTIGATION ITERATIONS ({len(self.iterations)}):**\n\n{iter_bodies}\n"
         return (
             "### Investigation Trace\n\n"
             f"**OBJECTIVE:** {self.objective}\n\n"
             f"**CURRENT HYPOTHESIS:** {self.hypothesis}\n\n"
+            f"{iter_section}"
             "**KNOWN EVIDENCE:**\n"
             f"{evidence}\n\n"
             "**UNCERTAINTIES:**\n"
