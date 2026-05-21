@@ -128,6 +128,10 @@ _TOPIC_CLI_COMMANDS: dict[str, list[list[str]]] = {
     ],
 }
 
+_SOURCE_FILE_EXTENSIONS: frozenset[str] = frozenset(
+    {".java", ".py", ".kt", ".go", ".ts", ".js", ".scala", ".cs", ".rb"}
+)
+
 # Default CLI commands used for topics not explicitly mapped above.
 _DEFAULT_CLI_COMMANDS: list[list[str]] = [
     ["find", ".", "-name", "*.java", "-type", "f"],
@@ -313,8 +317,6 @@ class AgenticInvestigatorLoop:
         - Iteration ≥ 2 with no other targets → sample git log for change context.
         - No targets at all       → repeat the base exploration commands.
         """
-        _SOURCE_EXTS = {".java", ".py", ".kt", ".go", ".ts", ".js", ".scala", ".cs", ".rb"}
-
         commands: list[list[str]] = []
         rationale_parts: list[str] = []
 
@@ -331,9 +333,9 @@ class AgenticInvestigatorLoop:
         inspected = 0
         for filepath in discovered_files:
             suffix = "." + filepath.rsplit(".", 1)[-1] if "." in filepath else ""
-            if suffix in _SOURCE_EXTS and inspected < 3:
+            if suffix in _SOURCE_FILE_EXTENSIONS and inspected < 3:
                 commands.append(
-                    ["grep", "-n", "class\\|interface\\|enum\\|def \\|func ", filepath]
+                    ["grep", "-En", "class|interface|enum|def |func ", filepath]
                 )
                 rationale_parts.append(f"Inspect symbols in {filepath}")
                 inspected += 1

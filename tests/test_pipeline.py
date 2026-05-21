@@ -420,14 +420,18 @@ class CliToolsTests(unittest.TestCase):
             executor = CliExecutor(tmp)
             loop = AgenticInvestigatorLoop(executor, max_iterations=3)
             trace = loop.investigate("architecture_overview.md", "architecture package", 0.5)
-            # If iteration 0 found files, iteration 1 should use branched commands.
-            if len(trace.iterations) > 1:
-                second_iter = trace.iterations[1]
-                # Branched plan rationale differs from the initial seed rationale.
-                self.assertNotEqual(
-                    second_iter.plan_rationale,
-                    trace.iterations[0].plan_rationale,
-                )
+            self.assertGreater(
+                len(trace.iterations),
+                1,
+                "expected multiple iterations to verify branching; only one recorded, "
+                "which indicates the early-stop triggered too soon",
+            )
+            second_iter = trace.iterations[1]
+            # Branched plan rationale must differ from the initial seed rationale.
+            self.assertNotEqual(
+                second_iter.plan_rationale,
+                trace.iterations[0].plan_rationale,
+            )
 
     def test_dataset_records_include_investigation_trace_for_agentic_categories(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
