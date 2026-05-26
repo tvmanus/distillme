@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import TYPE_CHECKING
+
+_LOG = logging.getLogger(__name__)
 
 from distillme.investigator import load_findings
 from distillme.retrieval import HybridRetriever
@@ -307,17 +310,45 @@ class TeacherAgent:
         self.llm_client = llm_client
         self.cli_executor = cli_executor
 
-    def run(self) -> dict[str, int]:
+    def run(self, resume: bool = True) -> dict[str, int]:
         self.paths.dataset_dir.mkdir(parents=True, exist_ok=True)
         findings = load_findings(self.paths.investigator_dir)
-        examples = self._examples(findings)
-        dataset_path = self.paths.dataset_dir / "instruction_dataset.jsonl"
-        with dataset_path.open("w", encoding="utf-8") as handle:
-            for example in examples:
+
+        partial_path = self.paths.dataset_dir / "instruction_dataset.partial.jsonl"
+        final_path = self.paths.dataset_dir / "instruction_dataset.jsonl"
+
+        # Resume: recover task_ids already written during a previous interrupted run.
+        completed_ids: frozenset[str] = frozenset()
+        if resume and partial_path.exists():
+            ids: set[str] = set()
+            for line in partial_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ids.add(json.loads(line)["task_id"])
+                except (json.JSONDecodeError, KeyError):
+                    pass
+            if ids:
+                completed_ids = frozenset(ids)
+                _LOG.warning("Resuming teacher stage: %d examples already written.", len(completed_ids))
+        elif not resume and partial_path.exists():
+            # Explicit restart: discard any leftover partial work.
+            partial_path.unlink()
+
+        total = len(completed_ids)
+        with partial_path.open("a", encoding="utf-8") as handle:
+            for example in self._examples(findings, skip_ids=completed_ids):
                 handle.write(json.dumps(example.to_jsonable(), sort_keys=True) + "\n")
+                handle.flush()  # each example survives an interrupt
+                total += 1
+
+        # Atomic rename so the final file is always a complete dataset.
+        partial_path.replace(final_path)
+
         manifest = {
             "schema": "distillme.dataset.v1",
-            "examples": len(examples),
+            "examples": total,
             "categories": list(TASK_CATEGORIES),
             "difficulties": list(DIFFICULTIES),
             "quality_controls": [
@@ -335,18 +366,31 @@ class TeacherAgent:
         (self.paths.dataset_dir / "manifest.json").write_text(
             json.dumps(manifest, indent=2), encoding="utf-8"
         )
-        return {"examples": len(examples)}
+        return {"examples": total}
 
-    def _examples(self, findings: list[dict[str, str]]) -> list[DatasetExample]:
-        """Generate one example per (category × difficulty) pair, cycling through findings."""
-        examples: list[DatasetExample] = []
+    def _examples(
+        self,
+        findings: list[dict[str, str]],
+        skip_ids: frozenset[str] = frozenset(),
+    ):
+        """Yield one DatasetExample per (category × difficulty) pair.
+
+        ``skip_ids`` contains task_ids already persisted in a partial file;
+        those iterations are skipped so only genuinely new examples are yielded.
+        ``global_index`` is always incremented even for skipped items to keep
+        task_id numbering stable across interrupted and resumed runs.
+        """
         finding_cycle = findings if findings else [{"path": "placeholder_no_findings", "text": ""}]
         global_index = 0
         for category in TASK_CATEGORIES:
             templates = _QUESTION_TEMPLATES[category]
             reasoning = _REASONING_TRACES[category]
             for diff_idx, difficulty in enumerate(DIFFICULTIES):
+                task_id = f"{category}-{difficulty}-{global_index:05d}"
                 finding = finding_cycle[global_index % len(finding_cycle)]
+                global_index += 1  # always increment so task_ids stay stable on resume
+                if task_id in skip_ids:
+                    continue
                 query = f"{category} {difficulty} {finding['path'].removesuffix('.md')}"
                 hits = self.retriever.search(query, top_k=4)
                 contexts = [hit.to_context() for hit in hits]
@@ -364,38 +408,34 @@ class TeacherAgent:
                     investigation_trace = _build_investigation_trace(
                         category, supporting_files, self.cli_executor
                     )
-                examples.append(
-                    DatasetExample(
-                        task_id=f"{category}-{difficulty}-{global_index:05d}",
-                        task_category=category,
-                        difficulty=difficulty,
-                        repository_context=f"Investigator document: {finding['path']}",
-                        retrieved_context=contexts,
-                        question=question,
-                        reasoning_trace=reasoning,
-                        answer=answer,
-                        supporting_files=supporting_files,
-                        symbols=symbols,
-                        architectural_constraints=[
-                            "Cite retrieved evidence for every repository-specific claim.",
-                            "Preserve uncertainty when source evidence is incomplete.",
-                            "Validate symbols against the index before recommending code changes.",
-                        ],
-                        validation_checks=[
-                            "supporting_files_exist",
-                            "retrieved_context_non_empty_when_available",
-                            "answer_contains_uncertainty_guardrail",
-                        ],
-                        negative_examples=[
-                            "Do not invent classes, APIs, runtime behaviour, or architectural intent "
-                            "absent from the retrieved context."
-                        ],
-                        confidence=confidence,
-                        investigation_trace=investigation_trace,
-                    )
+                yield DatasetExample(
+                    task_id=task_id,
+                    task_category=category,
+                    difficulty=difficulty,
+                    repository_context=f"Investigator document: {finding['path']}",
+                    retrieved_context=contexts,
+                    question=question,
+                    reasoning_trace=reasoning,
+                    answer=answer,
+                    supporting_files=supporting_files,
+                    symbols=symbols,
+                    architectural_constraints=[
+                        "Cite retrieved evidence for every repository-specific claim.",
+                        "Preserve uncertainty when source evidence is incomplete.",
+                        "Validate symbols against the index before recommending code changes.",
+                    ],
+                    validation_checks=[
+                        "supporting_files_exist",
+                        "retrieved_context_non_empty_when_available",
+                        "answer_contains_uncertainty_guardrail",
+                    ],
+                    negative_examples=[
+                        "Do not invent classes, APIs, runtime behaviour, or architectural intent "
+                        "absent from the retrieved context."
+                    ],
+                    confidence=confidence,
+                    investigation_trace=investigation_trace,
                 )
-                global_index += 1
-        return examples
 
     def _fallback_context(self) -> list[dict[str, object]]:
         if not self.retriever.chunks:

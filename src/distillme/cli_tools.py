@@ -137,7 +137,7 @@ class CliExecutor:
         self,
         repo_path: Path,
         timeout: int = 15,
-        max_output_chars: int = 8192,
+        max_output_chars: int = 32_768,
     ) -> None:
         self.repo_path = repo_path
         self.timeout = timeout
@@ -145,6 +145,17 @@ class CliExecutor:
 
     def run(self, args: list[str]) -> CliResult:
         """Validate and execute *args*, returning a :class:`CliResult`.
+
+        In addition to the OS-level approved commands, the following virtual
+        compound commands are supported and dispatched before the whitelist check:
+
+        ``grep_context PATTERN TARGET [CONTEXT_LINES]``
+            Finds *PATTERN* (extended regex) in *TARGET* (file or directory)
+            and returns *CONTEXT_LINES* lines of source around each match.
+            Internally chains ``grep -En`` → ``sed -n 'START,ENDp'`` for every
+            distinct match location (up to 5 blocks).  Output blocks are
+            prefixed with ``=== filepath:lineno ===`` headers so the LLM can
+            cite exact locations.
 
         Raises :class:`ValueError` when the command is forbidden or not in the
         approved list.  Subprocess failures (non-zero exit, timeout, missing
@@ -154,6 +165,9 @@ class CliExecutor:
         if not args:
             raise ValueError("empty command")
         cmd = args[0]
+        # ── Virtual compound commands (dispatched before the OS whitelist) ────
+        if cmd == "grep_context":
+            return self._run_grep_context(args)
         if cmd in _FORBIDDEN:
             raise ValueError(f"command is forbidden: {cmd!r}")
         if cmd not in _APPROVED_COMMANDS:
@@ -195,3 +209,133 @@ class CliExecutor:
                 returncode=-1,
                 truncated=False,
             )
+
+    # ------------------------------------------------------------------
+    # Compound tool: grep_context
+    # ------------------------------------------------------------------
+
+    def _run_grep_context(self, args: list[str]) -> CliResult:
+        """Implement the ``grep_context`` virtual compound command.
+
+        Algorithm
+        ---------
+        1. Run ``grep -En`` (extended regex, with line numbers) against *target*.
+           Adds ``-r --include=<source exts>`` when *target* is a directory.
+        2. Parse ``(filepath, lineno)`` pairs from grep output.
+        3. Collapse overlapping match locations into distinct windows.
+        4. For each window run ``sed -n 'START,ENDp' filepath`` to extract the
+           code block.  Windows are biased 1:2 before/after the match line so
+           the model sees the context that follows each hit.
+        5. Return up to 5 blocks separated by ``=== filepath:lineno ===`` headers.
+
+        Parameters decoded from *args*
+        --------------------------------
+        args[1]  PATTERN       Extended-regex pattern.  Use ``|`` for alternation.
+        args[2]  TARGET        File or directory path (relative to repo root).
+        args[3]  CONTEXT_LINES Number of lines per block (default 40).
+        """
+        if len(args) < 3:
+            raise ValueError("grep_context requires: PATTERN TARGET [CONTEXT_LINES]")
+
+        pattern, target = args[1], args[2]
+        context_lines = int(args[3]) if len(args) > 3 else 40
+
+        # Resolve target to decide file vs. directory mode.
+        target_abs = (self.repo_path / target.lstrip("./")).resolve()
+        is_dir = target_abs.is_dir()
+
+        # Step 1 — grep with extended regex and line numbers.
+        grep_cmd = ["grep", "-E", "-n"]
+        if is_dir:
+            grep_cmd += [
+                "-r",
+                "--include=*.java", "--include=*.py", "--include=*.kt",
+                "--include=*.go", "--include=*.ts", "--include=*.js",
+                "--include=*.scala", "--include=*.cs",
+            ]
+        grep_cmd += [pattern, target]
+
+        grep_res = self.run(grep_cmd)
+        if not grep_res.stdout.strip():
+            return CliResult(
+                command=" ".join(args),
+                stdout="",
+                stderr=grep_res.stderr or f"no matches for {pattern!r} in {target}",
+                returncode=1,
+                truncated=False,
+            )
+
+        # Step 2 — parse (filepath, lineno) pairs.
+        matches: list[tuple[str, int]] = []
+        for line in grep_res.stdout.splitlines():
+            line = line.strip()
+            if not line or line.startswith("Binary"):
+                continue
+            if is_dir:
+                # format: ./path/File.java:42:content
+                parts = line.split(":", 2)
+                if len(parts) >= 2:
+                    try:
+                        matches.append((parts[0], int(parts[1])))
+                    except ValueError:
+                        pass
+            else:
+                # format: 42:content
+                parts = line.split(":", 1)
+                try:
+                    matches.append((target, int(parts[0])))
+                except (ValueError, IndexError):
+                    pass
+
+        if not matches:
+            return CliResult(
+                command=" ".join(args),
+                stdout="",
+                stderr="could not parse grep output",
+                returncode=1,
+                truncated=False,
+            )
+
+        # Step 3 — collapse overlapping windows and extract blocks via sed.
+        matches.sort()  # sort by (file, lineno) so nearby hits cluster
+        blocks: list[str] = []
+        total_chars = 0
+        seen: set[tuple[str, int]] = set()  # (filepath, coarse_region)
+
+        for filepath, lineno in matches:
+            # Coarsen to regions so nearby matches share one block.
+            region = (filepath, lineno // max(1, context_lines))
+            if region in seen:
+                continue
+            seen.add(region)
+
+            # Bias window: show ~1/3 before, ~2/3 after the match.
+            start = max(1, lineno - context_lines // 3)
+            end = lineno + (2 * context_lines // 3)
+
+            sed_res = self.run(["sed", "-n", f"{start},{end}p", filepath])
+            if sed_res.succeeded and sed_res.stdout.strip():
+                block = f"=== {filepath}:{lineno} ===\n{sed_res.stdout.rstrip()}\n"
+                blocks.append(block)
+                total_chars += len(block)
+
+            if len(blocks) >= 5 or total_chars >= self.max_output_chars:
+                break
+
+        if not blocks:
+            return CliResult(
+                command=" ".join(args),
+                stdout="",
+                stderr="sed extraction yielded no content",
+                returncode=1,
+                truncated=False,
+            )
+
+        combined = "\n\n".join(blocks)
+        return CliResult(
+            command=" ".join(args),
+            stdout=combined[: self.max_output_chars],
+            stderr="",
+            returncode=0,
+            truncated=len(combined) > self.max_output_chars,
+        )

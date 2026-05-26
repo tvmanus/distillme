@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import json
 import time
 from dataclasses import asdict
@@ -35,26 +36,53 @@ class DistillationPipeline:
         self.state_path = self.paths.workdir / "state.json"
         self._cli = CliExecutor(config.repository_path)
 
-    def run(self, resume: bool = True) -> dict[str, StageResult]:
+    def run(self, resume: bool = True, from_stage: StageName | None = None) -> dict[str, StageResult]:
         state = self._load_state() if resume else {}
+
+        # --from-stage: drop state for that stage and everything after it so those
+        # stages are unconditionally re-run.  Earlier stages are left intact so their
+        # outputs are preserved and skipped as usual.
+        if from_stage is not None:
+            if from_stage not in STAGES:
+                raise ValueError(f"unknown stage: {from_stage!r}; valid stages: {STAGES}")
+            restart_idx = STAGES.index(from_stage)
+            for s in STAGES[restart_idx:]:
+                state.pop(s, None)
+            self._save_state(state)
+
+        # Intra-stage resume (skip already-written documents, reload partial files) only
+        # makes sense for a naturally-interrupted run.  --from-stage and --no-resume both
+        # start each affected stage from a clean slate.
+        intra_resume = resume and from_stage is None
+
         results: dict[str, StageResult] = {}
         for stage in STAGES:
             if resume and state.get(stage, {}).get("status") == "succeeded":
                 results[stage] = StageResult(stage=stage, status="succeeded", metrics=state[stage].get("metrics", {}))
                 continue
-            result = self._run_stage(stage)
+
+            # Persist a start breadcrumb so a crash leaves a timestamp in state.json.
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+            state.setdefault(stage, {})["started_at"] = now
+            self._save_state(state)
+
+            result = self._run_stage(stage, resume=intra_resume)
             results[stage] = result
-            state[stage] = _result_to_json(result)
+            state[stage] = {
+                **_result_to_json(result),
+                "started_at": state.get(stage, {}).get("started_at"),
+                "completed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+            }
             self._save_state(state)
             if result.status != "succeeded":
                 break
         return results
 
-    def _run_stage(self, stage: StageName) -> StageResult:
+    def _run_stage(self, stage: StageName, resume: bool = True) -> StageResult:
         started = time.time()
         self.trace.event("stage_started", stage=stage)
         try:
-            runner = self._runner_for(stage)
+            runner = self._runner_for(stage, resume=resume)
             metrics = runner()
             elapsed = time.time() - started
             metrics = {**metrics, "elapsed_seconds": round(elapsed, 4)}
@@ -64,13 +92,15 @@ class DistillationPipeline:
             self.trace.event("stage_failed", stage=stage, error=str(exc))
             return StageResult(stage=stage, status="failed", error=str(exc))
 
-    def _runner_for(self, stage: StageName) -> Callable[[], dict[str, int | float]]:
+    def _runner_for(self, stage: StageName, resume: bool = True) -> Callable[[], dict[str, int | float]]:
         if stage == "ingest":
             return RepositoryIngestor(self.config, self.paths).run
         if stage == "investigate":
-            return InvestigatorAgent(self.paths, self._retriever(), make_exclusive_client(self.config.investigator), self._cli).run
+            agent = InvestigatorAgent(self.paths, self._retriever(), make_exclusive_client(self.config.investigator), self._cli)
+            return lambda: agent.run(resume=resume)
         if stage == "teach":
-            return TeacherAgent(self.paths, self._retriever(), make_exclusive_client(self.config.teacher), self._cli).run
+            agent = TeacherAgent(self.paths, self._retriever(), make_exclusive_client(self.config.teacher), self._cli)
+            return lambda: agent.run(resume=resume)
         if stage == "validate":
             return ValidationPipeline(self.paths).run
         if stage == "train":

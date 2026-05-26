@@ -1,18 +1,18 @@
 {
-  "repository_path": "/absolute/path/to/java/repository",
-  "workdir": "/absolute/path/to/distillme-workdir",
+  "repository_path": "/home/slapin/distillme-repo",
+  "workdir": "/home/slapin/distillme-workdir",
   "models": {
     "investigator": {
-      "family": "gemini",
-      "model": "gemini-1.5-pro-or-compatible",
-      "endpoint": "local-or-distributed",
-      "max_context_tokens": 1000000,
+      "family": "qwen",
+      "model": "qwen3.6:27b-q8_0",
+      "endpoint": "http://localhost:11434",
+      "max_context_tokens": 250000,
       "batch_size": 1
     },
     "teacher": {
-      "family": "claude",
-      "model": "claude-3.5-sonnet-or-compatible",
-      "endpoint": "local-or-distributed",
+      "family": "gemma",
+      "model": "gemma4:31b-it-q8_0",
+      "endpoint": "http://localhost:11434",
       "max_context_tokens": 200000,
       "batch_size": 1
     },

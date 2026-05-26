@@ -107,14 +107,17 @@ class HttpEmbeddingClient(EmbeddingClient):
         model: str = "text-embedding-ada-002",
         timeout: int = 60,
         api_key: str = "",
+        max_chars: int = 8192,
     ) -> None:
         self.endpoint = endpoint.rstrip("/")
         self.model = model
         self.timeout = timeout
         self._api_key = api_key
+        self.max_chars = max_chars
 
     def embed(self, texts: Sequence[str]) -> list[list[float]]:
-        payload = json.dumps({"input": list(texts), "model": self.model}).encode()
+        truncated = [t[: self.max_chars] for t in texts]
+        payload = json.dumps({"input": truncated, "model": self.model}).encode()
         headers: dict[str, str] = {"Content-Type": "application/json"}
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
