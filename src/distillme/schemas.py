@@ -171,6 +171,75 @@ class InvestigationTrace:
 
 
 @dataclass(frozen=True)
+class InvestigatorFindingRecord:
+    """Structured investigator document record consumed by the teacher stage."""
+
+    document_name: str
+    topic: str
+    finding_title: str
+    confidence: float
+    supporting_evidence_references: tuple[str, ...] = ()
+    source_file_references: tuple[str, ...] = ()
+    unresolved_ambiguity: str = ""
+    architectural_implications: str = ""
+    investigation_iterations: tuple[dict[str, Any], ...] = ()
+    commands_executed: tuple[str, ...] = ()
+    findings_discovered_during_trace: tuple[str, ...] = ()
+    model_analysis: str = ""
+
+    def to_jsonable(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class CurriculumSection:
+    """Compiled curriculum section grounded in repository evidence."""
+
+    section_id: str
+    section_objective: str
+    prerequisite_sections: tuple[str, ...]
+    core_files: tuple[str, ...]
+    core_symbols: tuple[str, ...]
+    api_contracts: tuple[str, ...]
+    recurring_codebase_conventions: tuple[str, ...]
+    best_practice_patterns: tuple[str, ...]
+    invariants: tuple[str, ...]
+    execution_flows: tuple[str, ...]
+    failure_modes: tuple[str, ...]
+    evidence_references: tuple[str, ...]
+    confidence_score: float
+    ambiguity_open_questions: tuple[str, ...]
+    recommended_task_families: tuple[str, ...]
+    difficulty_score: float
+    investigator_topics: tuple[str, ...] = ()
+    compilation_iterations: int = 0
+
+    def to_jsonable(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class TopicUnit:
+    """Fine-grained teaching unit generated from one curriculum section."""
+
+    unit_id: str
+    section_id: str
+    objective: str
+    template_family: str
+    supervision_track: Literal["concept", "action", "reasoning", "uncertainty"]
+    prerequisite_unit_ids: tuple[str, ...]
+    evidence_references: tuple[str, ...]
+    supporting_files: tuple[str, ...]
+    symbols: tuple[str, ...]
+    difficulty_score: float
+    confidence_score: float
+    payload: dict[str, Any]
+
+    def to_jsonable(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class DatasetExample:
     """Synthetic instruction example emitted by the teacher stage."""
 
@@ -189,6 +258,15 @@ class DatasetExample:
     negative_examples: list[str]
     confidence: float
     investigation_trace: str = ""
+    curriculum_section_id: str = ""
+    topic_unit_id: str = ""
+    template_family: str = ""
+    template_fields: dict[str, Any] = field(default_factory=dict)
+    difficulty_score: float = 0.0
+    prerequisite_task_ids: list[str] = field(default_factory=list)
+    evidence_refs: list[str] = field(default_factory=list)
+    reasoning_steps: list[str] = field(default_factory=list)
+    supervision_track: str = ""
 
     def to_jsonable(self) -> dict[str, Any]:
         return asdict(self)

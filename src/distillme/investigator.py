@@ -5,10 +5,22 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import re
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 _LOG = logging.getLogger(__name__)
+
+
+def _extract_xml_block(text: str, tag: str) -> str:
+    """Return the content of the first ``<tag>…</tag>`` block in *text*, stripped.
+
+    Returns an empty string when the tag is absent.
+    """
+    pattern = re.compile(rf"<{re.escape(tag)}>([ \S]*?)</{re.escape(tag)}>", re.IGNORECASE | re.DOTALL)
+    match = pattern.search(text)
+    return match.group(1).strip() if match else ""
+
 
 from distillme.retrieval import RetrievalHit
 from distillme.retrieval import HybridRetriever
@@ -878,6 +890,508 @@ class AgenticInvestigatorLoop:
             )
 
 
+# ---------------------------------------------------------------------------
+# Multi-turn tool-use loop for evidence-grounded investigator synthesis
+# ---------------------------------------------------------------------------
+
+
+class _InvestigatorMultiTurnLoop:
+    """Multi-turn, tool-equipped loop for evidence-grounded investigator document synthesis.
+
+    Architecture
+    ------------
+    Replaces :class:`AgenticInvestigatorLoop`'s plan → execute → synthesize triple
+    per iteration with a unified XML-protocol conversation loop.  Each turn:
+
+    ``<think>``   Private scratchpad — STRIPPED after each turn.  The LLM
+                  reasons freely about what to explore next without that
+                  reasoning polluting the context window.
+
+    ``<tools>``   Up to ``MAX_TOOL_CALLS_PER_TURN`` JSON objects (one per line).
+                  Results are injected into the *next* prompt only, then discarded;
+                  the LLM must distil findings into ``<memo>`` to retain them.
+
+    ``<memo>``    Compressed architectural findings carried forward.  Accumulated
+                  across all turns up to ``MAX_MEMO_TOTAL_CHARS``; oldest entries
+                  are evicted when the cap is exceeded.
+
+    ``<final>``   Complete markdown analysis document.  Terminates the loop
+                  immediately when a non-empty block is found.
+
+    Memo budget rationale (``MAX_MEMO_TOTAL_CHARS = 16_000``)
+    ---------------------------------------------------------
+    ``_SYNTHESIS_MAX_TOKENS = 16_000`` is the token budget for one per-iteration
+    synthesis call.  The memo stores *compressed* versions of those findings,
+    targeting ~2 kB per turn over 8 turns.  At 16 kB memo + 20 kB tool results
+    (5 calls × 4 kB) + ~5 kB system/headers, the total continuation prompt stays
+    under ~41 kB — well inside the 875 kB context window.  This is 2.67× the
+    teacher synthesizer's 6 kB limit, proportional to the investigator's longer
+    output documents (500+ word architectural analyses vs. 12 Q&A pairs).
+    """
+
+    MAX_TOOL_CALLS_PER_TURN: int = 5
+    MAX_TOOL_OUTPUT_CHARS: int = 4_000
+    MAX_MEMO_TOTAL_CHARS: int = 16_000   # = _SYNTHESIS_MAX_TOKENS chars; 2.67× teacher
+
+    _TOOL_PROTOCOL: str = (
+        "\n\n## Multi-Turn Investigation Protocol\n"
+        "Use EXACTLY these XML tags every turn:\n\n"
+        "<think>\n"
+        "Private scratchpad — what evidence is missing, which files to read next.\n"
+        "STRIPPED from all subsequent prompts. Write freely.\n"
+        "</think>\n\n"
+        "<tools>\n"
+        '{"tool": "search", "query": "ClusterDriver connection", "top_k": 8}\n'
+        '{"tool": "grep_context", "pattern": "implements.*Reconnectable", "path": ".", "context_lines": 60}\n'
+        "</tools>\n\n"
+        "<memo>\n"
+        "Compressed findings — cite EXACT class names, method names, file paths.\n"
+        "PERSISTS across all subsequent turns. Be dense and specific. Omit if nothing new.\n"
+        "</memo>\n\n"
+        "When you have sufficient evidence for a thorough analysis, emit:\n\n"
+        "<final>\n"
+        "## Executive Summary\n...\n\n"
+        "## Detailed Findings\n...\n\n"
+        "## Design Rationale\n...\n\n"
+        "## Key Architectural Observations\n...\n"
+        "</final>\n\n"
+        "## Available Tools\n"
+        "  search         Semantic chunk search.\n"
+        '                 {"tool": "search", "query": "...", "top_k": 8}\n\n'
+        "  grep_context   Full-text search with N surrounding lines.\n"
+        '                 {"tool": "grep_context", "pattern": "...", "path": ".", "context_lines": 60}\n\n'
+        "  head           Read the first N lines of a file.\n"
+        '                 {"tool": "head", "path": "relative/path/File.java", "lines": 200}\n\n'
+        "  find           Find files by name glob.\n"
+        '                 {"tool": "find", "name_pattern": "*Driver*.java", "path": "."}\n\n'
+        "  grep           Discover files containing a pattern (returns file:line matches).\n"
+        '                 {"tool": "grep", "pattern": "ClusterDriver", "include": "*.java"}\n\n'
+        "## Quality Rules\n"
+        "- Every claim must cite specific class names, method signatures, or file:line locations.\n"
+        "- If evidence is insufficient for a claim, write \'Evidence insufficient for [claim]\'.\n"
+        "- Do NOT fabricate class names, method signatures, API contracts, or runtime behaviour.\n"
+        "- The final document must be 500+ words with concrete technical detail.\n"
+    )
+
+    def __init__(
+        self,
+        llm_client: "LLMClient",
+        retriever: "HybridRetriever",
+        cli_executor: "CliExecutor | None",
+        repo_root: Path,
+        max_turns: int = 8,
+    ) -> None:
+        self.llm_client = llm_client
+        self.retriever = retriever
+        self.cli_executor = cli_executor
+        self.repo_root = repo_root.resolve()
+        self.max_turns = max(3, max_turns)
+        self.codebase_context: "_CodebaseContext | None" = None
+
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
+
+    def investigate(
+        self,
+        document: str,
+        query: str,
+        retrieval_confidence: float,
+        rag_hits: "list[RetrievalHit] | None" = None,
+    ) -> "tuple[InvestigationTrace, list[str], str]":
+        """Run the multi-turn tool loop for *document*.
+
+        Returns a 3-tuple:
+        - ``trace``    — :class:`InvestigationTrace` with full command/finding history.
+        - ``insights`` — Accumulated memo texts (usable as fallback evidence).
+        - ``analysis`` — Complete markdown analysis from ``<final>`` block, or
+          ``""`` when the loop exhausted max_turns without a valid ``<final>``.
+        """
+        memo_history: list[str] = []  # persistent findings — prepended each turn
+        # Each tool-result entry: (tool_name, args, output, succeeded, truncated)
+        tool_results: list[tuple[str, dict[str, Any], str, bool, bool]] = []
+        insights: list[str] = []
+        commands_run: list[str] = []
+
+        prompt = self._build_initial_prompt(document, query, rag_hits)
+        system = _INVESTIGATOR_SYSTEM + self._TOOL_PROTOCOL
+
+        for turn_idx in range(self.max_turns):
+            turns_remaining = self.max_turns - turn_idx - 1
+            if turn_idx > 0:
+                prompt = self._build_continuation_prompt(
+                    memo_history, tool_results, turns_remaining
+                )
+
+            try:
+                raw = self.llm_client.generate(
+                    system, prompt, max_tokens=_SYNTHESIS_MAX_TOKENS
+                )
+            except Exception as exc:
+                _LOG.warning(
+                    "doc=%s turn=%d LLM call failed: %s", document, turn_idx, exc
+                )
+                break
+
+            think = _extract_xml_block(raw, "think")
+            memo = _extract_xml_block(raw, "memo")
+            tools_text = _extract_xml_block(raw, "tools")
+            final_text = _extract_xml_block(raw, "final")
+
+            if think:
+                _LOG.debug(
+                    "doc=%s turn=%d scratchpad=%d chars (not forwarded)",
+                    document, turn_idx, len(think),
+                )
+
+            # Accumulate memo; evict oldest entries when the cap is exceeded.
+            if memo:
+                memo_history.append(memo)
+                insights.append(memo)
+                total_chars = sum(len(m) for m in memo_history)
+                while total_chars > self.MAX_MEMO_TOTAL_CHARS and len(memo_history) > 1:
+                    total_chars -= len(memo_history.pop(0))
+
+            # A non-empty <final> block ends the loop immediately.
+            if final_text.strip():
+                _LOG.info(
+                    "doc=%s: multi-turn investigation done in %d turn(s)",
+                    document, turn_idx + 1,
+                )
+                return (
+                    self._build_trace(
+                        document, query, retrieval_confidence, commands_run, insights
+                    ),
+                    insights,
+                    final_text.strip(),
+                )
+
+            # Tool calls — results visible only in the next prompt.
+            tool_results = []
+            if tools_text:
+                for tool_name, args in self._parse_tool_calls(tools_text):
+                    output, ok, trunc = self._execute_tool(tool_name, args)
+                    commands_run.append(f"{tool_name}({json.dumps(args, separators=(',', ':'))})")
+                    if ok and output.strip():
+                        insights.append(f"[{tool_name}] {output[:200]}")
+                    tool_results.append((tool_name, args, output, ok, trunc))
+                    _LOG.debug(
+                        "doc=%s turn=%d tool=%s ok=%s chars=%d",
+                        document, turn_idx, tool_name, ok, len(output),
+                    )
+
+        # Exhausted max_turns — one unconditional forcing pass.
+        final_text = self._force_final(document, memo_history)
+        return (
+            self._build_trace(
+                document, query, retrieval_confidence, commands_run, insights
+            ),
+            insights,
+            final_text,
+        )
+
+    # ------------------------------------------------------------------
+    # Prompt construction
+    # ------------------------------------------------------------------
+
+    def _build_initial_prompt(
+        self,
+        document: str,
+        query: str,
+        rag_hits: "list[RetrievalHit] | None",
+    ) -> str:
+        topic = document.removesuffix(".md").replace("_", " ")
+        synthesis_question = _TOPIC_SYNTHESIS_QUESTIONS.get(
+            document,
+            f"What are the key architectural and implementation insights about {topic}?",
+        )
+        codebase_header = ""
+        if self.codebase_context:
+            codebase_header = (
+                f"## Codebase Overview ({self.codebase_context.total_source_files} source files)\n"
+                f"{self.codebase_context.module_overview}\n\n"
+            )
+        rag_block = ""
+        if rag_hits:
+            rag_lines: list[str] = []
+            for hit in rag_hits[:_RAG_CHUNKS_PER_TOPIC]:
+                rag_lines.append(
+                    f"  [{hit.chunk.path}:{hit.chunk.start_line}-{hit.chunk.end_line}]"
+                    f" score={hit.score:.2f}\n"
+                    f"  {str(hit.chunk.text)[:_RAG_CHUNK_CHARS]}"
+                )
+            rag_block = (
+                "## Seed RAG Hits (use as starting points for tool calls)\n"
+                + "\n\n".join(rag_lines)
+                + "\n\n"
+            )
+        return (
+            f"{codebase_header}"
+            f"## Investigation Topic: {topic}\n"
+            f"Seed query: `{query}`\n\n"
+            f"## Analysis Question\n{synthesis_question}\n\n"
+            f"{rag_block}"
+            "## Your Task\n"
+            "Use tools to gather comprehensive evidence. When ready, emit a "
+            "<final> block containing a complete 500+ word markdown analysis.\n"
+        )
+
+    def _build_continuation_prompt(
+        self,
+        memo_history: list[str],
+        tool_results: list[tuple[str, dict[str, Any], str, bool, bool]],
+        turns_remaining: int,
+    ) -> str:
+        """Build the next user-turn prompt.
+
+        Only memo history and the latest batch of tool output are included.
+        Earlier tool outputs are deliberately omitted — the LLM is responsible
+        for distilling important findings into ``<memo>`` before they are lost.
+        """
+        parts: list[str] = []
+
+        if memo_history:
+            memos_block = "\n\n".join(
+                f"[memo/{i + 1}]\n{memo}" for i, memo in enumerate(memo_history)
+            )
+            parts.append(f"## Your Accumulated Findings\n{memos_block}")
+
+        if tool_results:
+            result_blocks: list[str] = []
+            for tool_name, args, output, ok, trunc in tool_results:
+                args_brief = ", ".join(f"{k}={repr(v)[:50]}" for k, v in args.items())
+                status = "OK" if ok else "FAILED"
+                trunc_note = " [truncated]" if trunc else ""
+                result_blocks.append(
+                    f"### {tool_name}({args_brief}) [{status}]{trunc_note}\n{output}"
+                )
+            parts.append("## Latest Tool Results\n" + "\n\n".join(result_blocks))
+
+        if turns_remaining == 0:
+            parts.append(
+                "**Final turn.** Emit a <final> block now with the complete markdown analysis. "
+                "Mark evidence gaps explicitly rather than fabricating."
+            )
+        elif turns_remaining == 1:
+            parts.append(
+                f"You have {turns_remaining} turn remaining. Consider emitting <final> soon."
+            )
+
+        return "\n\n".join(parts)
+
+    # ------------------------------------------------------------------
+    # Tool call parsing
+    # ------------------------------------------------------------------
+
+    def _parse_tool_calls(
+        self, tools_text: str
+    ) -> list[tuple[str, dict[str, Any]]]:
+        calls: list[tuple[str, dict[str, Any]]] = []
+        for line in tools_text.strip().splitlines():
+            line = line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                obj: dict[str, Any] = json.loads(line)
+                name = str(obj.pop("tool", "")).strip()
+                if name:
+                    calls.append((name, obj))
+            except json.JSONDecodeError:
+                pass
+        return calls[: self.MAX_TOOL_CALLS_PER_TURN]
+
+    # ------------------------------------------------------------------
+    # Tool execution
+    # ------------------------------------------------------------------
+
+    def _execute_tool(
+        self, tool: str, args: dict[str, Any]
+    ) -> tuple[str, bool, bool]:
+        """Execute one tool call.  Returns ``(output, succeeded, truncated)``."""
+        try:
+            if tool == "search":
+                raw = self._tool_search(args)
+            elif tool == "grep_context":
+                raw = self._tool_grep_context(args)
+            elif tool == "head":
+                raw = self._tool_head(args)
+            elif tool == "find":
+                raw = self._tool_find(args)
+            elif tool == "grep":
+                raw = self._tool_grep(args)
+            else:
+                return (
+                    f"Unknown tool '{tool}'. Available: search, grep_context, head, find, grep.",
+                    False,
+                    False,
+                )
+            output, trunc = self._truncate(raw)
+            return output, True, trunc
+        except Exception as exc:
+            return f"Execution error: {exc}", False, False
+
+    def _tool_search(self, args: dict[str, Any]) -> str:
+        query = str(args.get("query", "")).strip()
+        if not query:
+            return "Error: 'query' is required."
+        top_k = max(4, min(24, int(args.get("top_k", 8))))
+        hits = self.retriever.search(query, top_k=top_k)
+        if not hits:
+            return "No results found."
+        lines: list[str] = []
+        for hit in hits:
+            lines.append(
+                f"--- {hit.chunk.path}:{hit.chunk.start_line}-{hit.chunk.end_line}"
+                f" (score={hit.score:.3f}) ---"
+            )
+            lines.append(str(hit.chunk.text)[:600])
+        return "\n".join(lines)
+
+    def _tool_grep_context(self, args: dict[str, Any]) -> str:
+        if self.cli_executor is None:
+            return "CLI executor not available."
+        pattern = str(args.get("pattern", "")).strip()
+        if not pattern:
+            return "Error: 'pattern' is required."
+        path = str(args.get("path", ".")).strip() or "."
+        ctx_lines = max(10, min(120, int(args.get("context_lines", 60))))
+        result = self.cli_executor.run(["grep_context", pattern, path, str(ctx_lines)])
+        return result.stdout if result.succeeded else f"grep_context failed: {result.stderr}"
+
+    def _tool_head(self, args: dict[str, Any]) -> str:
+        path = str(args.get("path", "")).strip().lstrip("./").strip()
+        if not path:
+            return "Error: 'path' is required."
+        lines = max(10, min(_FILE_LINES_PER_READ, int(args.get("lines", _FILE_LINES_PER_READ))))
+        # Prefer direct read (path-traversal safe); fall back to CLI head.
+        safe = self._safe_repo_file(path)
+        if safe and safe.is_file():
+            try:
+                content = safe.read_text(encoding="utf-8", errors="replace")
+                return "\n".join(content.splitlines()[:lines])
+            except OSError:
+                pass
+        if self.cli_executor is not None:
+            result = self.cli_executor.run(["head", f"-{lines}", path])
+            if result.succeeded:
+                return result.stdout
+        return f"File not accessible: {path}"
+
+    def _tool_find(self, args: dict[str, Any]) -> str:
+        if self.cli_executor is None:
+            return "CLI executor not available."
+        pattern = str(args.get("name_pattern", args.get("pattern", ""))).strip()
+        if not pattern:
+            return "Error: 'name_pattern' is required."
+        path = str(args.get("path", ".")).strip() or "."
+        result = self.cli_executor.run(["find", path, "-name", pattern, "-type", "f"])
+        return result.stdout if result.succeeded else f"find failed: {result.stderr}"
+
+    def _tool_grep(self, args: dict[str, Any]) -> str:
+        if self.cli_executor is None:
+            return "CLI executor not available."
+        pattern = str(args.get("pattern", "")).strip()
+        if not pattern:
+            return "Error: 'pattern' is required."
+        include = str(args.get("include", "*.java")).strip() or "*.java"
+        path = str(args.get("path", ".")).strip() or "."
+        result = self.cli_executor.run(
+            ["grep", "-rn", f"--include={include}", pattern, path]
+        )
+        return result.stdout if result.succeeded else f"grep failed: {result.stderr}"
+
+    # ------------------------------------------------------------------
+    # Fallback: force final from accumulated memos
+    # ------------------------------------------------------------------
+
+    def _force_final(self, document: str, memo_history: list[str]) -> str:
+        """One unconditional LLM call demanding a ``<final>`` block."""
+        topic = document.removesuffix(".md").replace("_", " ")
+        synthesis_question = _TOPIC_SYNTHESIS_QUESTIONS.get(
+            document,
+            f"What are the key architectural and implementation insights about {topic}?",
+        )
+        memos_text = (
+            "\n\n".join(f"[memo/{i + 1}]\n{m}" for i, m in enumerate(memo_history))
+            if memo_history
+            else "(no memos written — synthesise from the investigation question and seed evidence)"
+        )
+        prompt = (
+            f"## Topic: {topic}\n"
+            f"## Analysis Question\n{synthesis_question}\n\n"
+            f"## Accumulated Findings\n{memos_text}\n\n"
+            "You MUST emit a <final> block now with the complete markdown analysis. "
+            "Structure it as: Executive Summary / Detailed Findings / Design Rationale / "
+            "Key Architectural Observations. Mark evidence gaps explicitly."
+        )
+        try:
+            raw = self.llm_client.generate(
+                _INVESTIGATOR_SYSTEM + self._TOOL_PROTOCOL,
+                prompt,
+                max_tokens=_ANALYSIS_MAX_TOKENS,
+            )
+            final_text = _extract_xml_block(raw, "final")
+            # Some models emit bare markdown without the tag; accept it as-is.
+            return final_text.strip() if final_text else raw.strip()
+        except Exception as exc:
+            _LOG.warning("_force_final failed for doc=%s: %s", document, exc)
+            return ""
+
+    # ------------------------------------------------------------------
+    # Utilities
+    # ------------------------------------------------------------------
+
+    def _build_trace(
+        self,
+        document: str,
+        query: str,
+        confidence: float,
+        commands_run: list[str],
+        insights: list[str],
+    ) -> InvestigationTrace:
+        topic = document.removesuffix(".md").replace("_", " ")
+        memo_count = len([i for i in insights if not i.startswith("[")])
+        return InvestigationTrace(
+            objective=f"Multi-turn tool-use investigation of '{topic}' seeded by: {query!r}",
+            hypothesis=(
+                f"Multi-turn loop gathered {len(insights)} finding(s) across "
+                f"{len(commands_run)} tool call(s)."
+            ),
+            known_evidence=tuple(insights[:20]),
+            uncertainties=(
+                "Static analysis alone cannot confirm runtime behaviour.",
+                "Indexed artifacts may not represent the full deployed codebase.",
+            ),
+            commands_run=tuple(commands_run),
+            command_summaries=tuple(commands_run),
+            updated_understanding=(
+                f"Multi-turn investigation completed {len(commands_run)} tool call(s), "
+                f"producing {memo_count} compressed memo block(s). "
+                "Findings are combined with vector-retrieved context for final document synthesis."
+            ),
+            next_investigation_step=(
+                "Validate findings against retrieved RAG context and cross-check with "
+                "model-driven analysis before high-confidence training use."
+            ),
+            confidence=confidence,
+            iterations=(),
+        )
+
+    def _truncate(self, text: str) -> tuple[str, bool]:
+        if len(text) <= self.MAX_TOOL_OUTPUT_CHARS:
+            return text, False
+        return text[: self.MAX_TOOL_OUTPUT_CHARS] + "\n\u2026[output truncated]", True
+
+    def _safe_repo_file(self, rel_path: str) -> Path | None:
+        """Return an absolute path only if it resolves safely inside *repo_root*."""
+        candidate = (self.repo_root / rel_path).resolve()
+        try:
+            candidate.relative_to(self.repo_root)
+        except ValueError:
+            return None
+        return candidate
+
+
 class InvestigatorAgent:
     """Produces the required finding documents from indexed evidence."""
 
@@ -896,6 +1410,17 @@ class InvestigatorAgent:
             AgenticInvestigatorLoop(cli_executor, llm_client=llm_client)
             if cli_executor is not None else None
         )
+        # Prefer the multi-turn loop when an LLM is available; it drives its
+        # own evidence gathering via the <think>/<tools>/<memo>/<final> protocol.
+        self._multi_turn_loop: _InvestigatorMultiTurnLoop | None = (
+            _InvestigatorMultiTurnLoop(
+                llm_client=llm_client,
+                retriever=retriever,
+                cli_executor=cli_executor,
+                repo_root=paths.repository,
+            )
+            if llm_client is not None and cli_executor is not None else None
+        )
 
     def run(self, resume: bool = True) -> dict[str, int]:
         self.paths.investigator_dir.mkdir(parents=True, exist_ok=True)
@@ -909,10 +1434,13 @@ class InvestigatorAgent:
         all_done = resume and all(
             (self.paths.investigator_dir / doc).exists() for doc in MANDATORY_DOCUMENTS
         )
-        if self._agentic_loop is not None and not all_done:
+        if (self._multi_turn_loop is not None or self._agentic_loop is not None) and not all_done:
             codebase_context = self._build_codebase_context()
             if codebase_context is not None:
-                self._agentic_loop.codebase_context = codebase_context
+                if self._multi_turn_loop is not None:
+                    self._multi_turn_loop.codebase_context = codebase_context
+                if self._agentic_loop is not None:
+                    self._agentic_loop.codebase_context = codebase_context
 
         # ── Phase 2: Per-topic Investigation ──────────────────────────────────
         written = 0
@@ -927,11 +1455,24 @@ class InvestigatorAgent:
             finding = self._finding_for(document, query, hits)
             trace: InvestigationTrace | None = None
             insights: list[str] = []
-            if self._agentic_loop is not None:
+            model_analysis: str
+            if self._multi_turn_loop is not None:
+                # Multi-turn loop drives its own tool use and emits a complete
+                # analysis in <final>; skip the separate _model_analysis() call
+                # when a non-empty analysis was produced.
+                trace, insights, analysis = self._multi_turn_loop.investigate(
+                    document, query, finding.confidence, rag_hits=hits
+                )
+                model_analysis = analysis if analysis else self._model_analysis(
+                    document, hits, insights, codebase_context
+                )
+            elif self._agentic_loop is not None:
                 trace, insights = self._agentic_loop.investigate(
                     document, query, finding.confidence, rag_hits=hits
                 )
-            model_analysis = self._model_analysis(document, hits, insights, codebase_context)
+                model_analysis = self._model_analysis(document, hits, insights, codebase_context)
+            else:
+                model_analysis = self._model_analysis(document, hits, [], codebase_context)
             target.write_text(
                 _render_document(document, query, finding, model_analysis, trace),
                 encoding="utf-8",

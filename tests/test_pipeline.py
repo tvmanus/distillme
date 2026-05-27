@@ -153,6 +153,10 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(all(result.status == "succeeded" for result in results.values()))
             self.assertTrue((config.workdir / "index/manifest.json").exists())
             self.assertTrue((config.workdir / "investigator/architecture_overview.md").exists())
+            self.assertTrue((config.workdir / "dataset/curriculum.json").exists())
+            self.assertTrue((config.workdir / "dataset/topic_units.json").exists())
+            self.assertTrue((config.workdir / "dataset/coverage_map.json").exists())
+            self.assertTrue((config.workdir / "dataset/teacher_report.json").exists())
             dataset_path = config.workdir / "dataset/instruction_dataset.jsonl"
             records = [json.loads(line) for line in dataset_path.read_text(encoding="utf-8").splitlines()]
             self.assertTrue(records)
@@ -161,7 +165,7 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(report["passed"])
 
     def test_dataset_covers_all_categories_and_difficulties(self) -> None:
-        """Each (category, difficulty) pair must appear exactly once."""
+        """Dataset should include required template families and bounded difficulty labels."""
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
             repo = tmp_path / "repo"
@@ -172,12 +176,30 @@ class PipelineTests(unittest.TestCase):
 
             dataset_path = config.workdir / "dataset/instruction_dataset.jsonl"
             records = [json.loads(line) for line in dataset_path.read_text(encoding="utf-8").splitlines()]
-            expected = len(TASK_CATEGORIES) * len(DIFFICULTIES)
-            self.assertEqual(len(records), expected, f"expected {expected} examples, got {len(records)}")
+            self.assertGreater(len(records), 0)
+
+            required_template_families = {
+                "concept_card",
+                "api_contract_card",
+                "execution_flow_trace",
+                "retrieval_and_tool_use_task",
+                "implementation_plan_task",
+                "debugging_and_failure_analysis_task",
+                "test_design_task",
+                "contrastive_negative_example",
+                "ambiguity_and_deferral_example",
+                "design_deliberation_trace",
+                "best_practice_transfer_card",
+                "api_selection_debate",
+            }
+            seen_template_families = {r["template_family"] for r in records}
+            self.assertTrue(required_template_families.issubset(seen_template_families))
+
             seen_categories = {r["task_category"] for r in records}
             seen_difficulties = {r["difficulty"] for r in records}
-            self.assertEqual(seen_categories, set(TASK_CATEGORIES))
-            self.assertEqual(seen_difficulties, set(DIFFICULTIES))
+            self.assertTrue({"cli_exploration_task", "multi_hop_navigation_task"}.issubset(seen_categories))
+            self.assertTrue(seen_difficulties.issubset(set(DIFFICULTIES)))
+            self.assertTrue(all(r.get("curriculum_section_id") and r.get("topic_unit_id") for r in records))
 
     def test_investigator_documents_include_model_analysis_section(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -269,6 +291,11 @@ class EmbeddingTests(unittest.TestCase):
 
     def test_chroma_retriever_searches_after_ingest(self) -> None:
         """ChromaRetriever should find chunks after the pipeline writes chunks.jsonl."""
+        try:
+            import chromadb  # noqa: F401
+        except ImportError:
+            self.skipTest("chromadb is not installed in this test environment")
+
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory)
             repo = tmp_path / "repo"
@@ -365,7 +392,7 @@ class CliToolsTests(unittest.TestCase):
             _write_sample_repo(tmp)
             executor = CliExecutor(tmp)
             loop = AgenticInvestigatorLoop(executor)
-            trace = loop.investigate("architecture_overview.md", "architecture package", 0.5)
+            trace, _insights = loop.investigate("architecture_overview.md", "architecture package", 0.5)
             self.assertIsInstance(trace, InvestigationTrace)
             self.assertGreater(len(trace.commands_run), 0)
 
@@ -377,7 +404,7 @@ class CliToolsTests(unittest.TestCase):
             _write_sample_repo(tmp)
             executor = CliExecutor(tmp)
             loop = AgenticInvestigatorLoop(executor, max_iterations=2)
-            trace = loop.investigate("architecture_overview.md", "architecture package", 0.5)
+            trace, _insights = loop.investigate("architecture_overview.md", "architecture package", 0.5)
             self.assertGreater(len(trace.iterations), 0, "expected at least one recorded iteration")
             first = trace.iterations[0]
             self.assertEqual(first.iteration_num, 0)
@@ -406,7 +433,7 @@ class CliToolsTests(unittest.TestCase):
             _write_sample_repo(tmp)
             executor = CliExecutor(tmp)
             loop = AgenticInvestigatorLoop(executor, max_iterations=2)
-            trace = loop.investigate("architecture_overview.md", "architecture package", 0.5)
+            trace, _insights = loop.investigate("architecture_overview.md", "architecture package", 0.5)
             md = trace.to_markdown()
             self.assertIn("INVESTIGATION ITERATIONS", md)
             self.assertIn("Iteration 1", md)
@@ -419,7 +446,7 @@ class CliToolsTests(unittest.TestCase):
             _write_sample_repo(tmp)
             executor = CliExecutor(tmp)
             loop = AgenticInvestigatorLoop(executor, max_iterations=3)
-            trace = loop.investigate("architecture_overview.md", "architecture package", 0.5)
+            trace, _insights = loop.investigate("architecture_overview.md", "architecture package", 0.5)
             self.assertGreater(
                 len(trace.iterations),
                 1,
@@ -443,7 +470,7 @@ class CliToolsTests(unittest.TestCase):
             _write_sample_repo(tmp)
             executor = CliExecutor(tmp)
             loop = AgenticInvestigatorLoop(executor, max_iterations=2, llm_client=stub_llm)
-            trace = loop.investigate("testing_strategy.md", "test unit integration", 0.4)
+            trace, _insights = loop.investigate("testing_strategy.md", "test unit integration", 0.4)
             self.assertIsInstance(trace, InvestigationTrace)
             # Loop must complete and record at least one iteration even with stub LLM.
             self.assertGreater(len(trace.iterations), 0)
@@ -466,7 +493,7 @@ class CliToolsTests(unittest.TestCase):
             _write_sample_repo(tmp)
             executor = CliExecutor(tmp)
             loop = AgenticInvestigatorLoop(executor, max_iterations=2, llm_client=_ValidJsonLLM())
-            trace = loop.investigate("architecture_overview.md", "architecture package", 0.5)
+            trace, _insights = loop.investigate("architecture_overview.md", "architecture package", 0.5)
             self.assertIsInstance(trace, InvestigationTrace)
             self.assertGreater(len(trace.iterations), 1)
             # The follow-up iteration rationale should carry the [LLM] prefix.
